@@ -163,10 +163,12 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	const outputItems: ResponseInput = [];
 	const isDifferentModel =
 		assistantMsg.model !== model.id && assistantMsg.provider === model.provider && assistantMsg.api === model.api;
-	// Native response item ids can be bound to encrypted reasoning items. When
-	// cold resume omits reasoning, replay the content without ids so
-	// OpenAI/Azure does not reject history for missing paired reasoning.
-	const canReplayNativeItemIds = includeThinkingSignatures && !isDifferentModel;
+	const hasReplayableThinking =
+		assistantMsg.stopReason !== "error" &&
+		assistantMsg.content.some(block => block.type === "thinking" && Boolean(block.thinkingSignature));
+	// Native response item ids can be bound to encrypted reasoning items. Replay
+	// ids only when this exact assistant message also replays its reasoning.
+	const canReplayNativeItemIds = includeThinkingSignatures && !isDifferentModel && hasReplayableThinking;
 
 	for (const block of assistantMsg.content) {
 		if (block.type === "thinking" && assistantMsg.stopReason !== "error") {

@@ -471,6 +471,67 @@ describe("OpenAI responses history payload", () => {
 		expect(customOutput?.call_id).toBe("call_edit");
 	});
 
+	it("strips native item ids from rebuilt history without replayable thinking even after warmup", async () => {
+		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "first user", timestamp: Date.now() },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "text",
+							text: "assistant text",
+							textSignature: JSON.stringify({ v: 1, id: "msg_native_message" }),
+						},
+						{
+							type: "toolCall",
+							id: "call_read|fc_native_function",
+							name: "read",
+							arguments: { path: "README.md" },
+						},
+					],
+					api: "openai-responses",
+					provider: "openai",
+					model: "gpt-5-mini",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_read|fc_native_function",
+					toolName: "read",
+					content: [{ type: "text", text: "read output" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "follow-up", timestamp: Date.now() },
+			],
+		};
+
+		await captureResponsesPayload(model, context, providerSessionState);
+		markResponsesProviderSessionStateWarmed(providerSessionState);
+		const payload = (await captureResponsesPayload(model, context, providerSessionState)) as { input?: unknown[] };
+		const assistantMessage = findResponsesInputItem(payload.input, "message");
+		const functionCall = findResponsesInputItem(payload.input, "function_call");
+		const functionOutput = findResponsesInputItem(payload.input, "function_call_output");
+
+		expect(containsEncryptedReasoning(payload.input)).toBe(false);
+		expect(assistantMessage?.id).toBeUndefined();
+		expect(functionCall?.id).toBeUndefined();
+		expect(functionCall?.call_id).toBe("call_read");
+		expect(functionOutput?.call_id).toBe("call_read");
+	});
+
 	it("does not replay stale thinking signatures when native replay is cold", async () => {
 		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const providerSessionState = new Map<string, ProviderSessionState>();
@@ -606,16 +667,14 @@ describe("OpenAI responses history payload", () => {
 			{
 				type: "message",
 				role: "assistant",
-				content: [{ type: "output_text", text: "Commentary answer", annotations: [] }],
-				status: "completed",
-				id: "msg_commentary",
+				content: "Commentary answer",
 				phase: "commentary",
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up" }] },
 		]);
 	});
 
-	it("keeps legacy plain-string text signatures when rebuilding fallback replay history", async () => {
+	it("strips legacy plain-string text signature ids when rebuilding fallback replay history without reasoning", async () => {
 		const context: Context = {
 			messages: [
 				{ role: "user", content: "first user", timestamp: Date.now() },
@@ -646,9 +705,7 @@ describe("OpenAI responses history payload", () => {
 			{
 				type: "message",
 				role: "assistant",
-				content: [{ type: "output_text", text: "Legacy answer", annotations: [] }],
-				status: "completed",
-				id: "msg_legacy",
+				content: "Legacy answer",
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up" }] },
 		]);

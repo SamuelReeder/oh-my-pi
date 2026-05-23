@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed cold `omp --resume` on OpenAI Responses sessions replaying native assistant/tool item ids without their paired encrypted reasoning items, which caused Azure/OpenAI-compatible gateways to reject follow-up turns with `400 status code (no body)`.
+- Fixed resumed OpenAI Responses sessions replaying native assistant/tool item ids without the same message's paired encrypted reasoning item, which caused Azure/OpenAI-compatible gateways to reject follow-up turns with `400 status code (no body)`.
 - Fixed OpenAI Responses `400 status code (no body)` errors being misclassified as context overflow; `413` no-body errors and non-Responses 400 no-body overflow handling remain classified as overflow.
 
 ## [15.2.4] - 2026-05-22

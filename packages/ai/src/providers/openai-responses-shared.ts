@@ -163,6 +163,10 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	const outputItems: ResponseInput = [];
 	const isDifferentModel =
 		assistantMsg.model !== model.id && assistantMsg.provider === model.provider && assistantMsg.api === model.api;
+	// Native response item ids can be bound to encrypted reasoning items. When
+	// cold resume omits reasoning, replay the content without ids so
+	// OpenAI/Azure does not reject history for missing paired reasoning.
+	const canReplayNativeItemIds = includeThinkingSignatures && !isDifferentModel;
 
 	for (const block of assistantMsg.content) {
 		if (block.type === "thinking" && assistantMsg.stopReason !== "error") {
@@ -177,6 +181,26 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 
 		if (block.type === "text") {
 			const parsedSignature = parseTextSignature(block.textSignature);
+			const text = block.text.toWellFormed();
+			if (!canReplayNativeItemIds) {
+				outputItems.push({
+					type: "message",
+					role: "assistant",
+					content: text,
+					...(parsedSignature?.phase ? { phase: parsedSignature.phase } : {}),
+				} satisfies ResponseInput[number]);
+				continue;
+			}
+
+			const content = [{ type: "output_text" as const, text, annotations: [] }];
+			const baseMessage = {
+				type: "message" as const,
+				role: "assistant" as const,
+				content,
+				status: "completed" as const,
+				...(parsedSignature?.phase ? { phase: parsedSignature.phase } : {}),
+			};
+
 			let msgId = parsedSignature?.id;
 			if (!msgId) {
 				msgId = `msg_${msgIndex}`;
@@ -184,12 +208,8 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 				msgId = `msg_${Bun.hash(msgId).toString(36)}`;
 			}
 			outputItems.push({
-				type: "message",
-				role: "assistant",
-				content: [{ type: "output_text", text: block.text.toWellFormed(), annotations: [] }],
-				status: "completed",
+				...baseMessage,
 				id: msgId,
-				phase: parsedSignature?.phase,
 			} satisfies ResponseOutputMessage);
 			continue;
 		}
@@ -200,7 +220,10 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 
 		const normalized = normalizeResponsesToolCallId(block.id, block.customWireName ? "ctc" : "fc");
 		let itemId: string | undefined = normalized.itemId;
-		if (isDifferentModel && (itemId?.startsWith("fc_") || itemId?.startsWith("fcr_") || itemId?.startsWith("ctc_"))) {
+		if (
+			!canReplayNativeItemIds &&
+			(itemId?.startsWith("fc_") || itemId?.startsWith("fcr_") || itemId?.startsWith("ctc_"))
+		) {
 			itemId = undefined;
 		}
 		knownCallIds.add(normalized.callId);

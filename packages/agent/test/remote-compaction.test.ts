@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildOpenAiNativeHistory, requestOpenAiRemoteCompaction } from "@oh-my-pi/pi-agent-core/compaction/openai";
+import {
+	buildOpenAiNativeHistory,
+	requestOpenAiRemoteCompaction,
+	shouldUseOpenAiRemoteCompaction,
+} from "@oh-my-pi/pi-agent-core/compaction/openai";
 import type { AssistantMessage, Model, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
 import { hookFetch } from "@oh-my-pi/pi-utils";
 
@@ -102,6 +106,25 @@ describe("buildOpenAiNativeHistory custom tool calls", () => {
 		const items = buildOpenAiNativeHistory([assistant], makeOpenAiModel());
 		expect(items.find(item => item.type === "function_call")).toBeDefined();
 		expect(items.find(item => item.type === "custom_tool_call")).toBeUndefined();
+	});
+});
+
+describe("OpenAI remote compaction provider gating", () => {
+	test("uses remote compaction only for first-party OpenAI and Codex endpoints", () => {
+		expect(shouldUseOpenAiRemoteCompaction(makeOpenAiModel())).toBe(true);
+		expect(shouldUseOpenAiRemoteCompaction(makeOpenAiModel({ baseUrl: "https://api.openai.com/v1/" }))).toBe(true);
+		expect(shouldUseOpenAiRemoteCompaction(makeOpenAiModel({ baseUrl: "https://llm-api.amd.com/OpenAI" }))).toBe(
+			false,
+		);
+		expect(shouldUseOpenAiRemoteCompaction(makeOpenAiModel({ baseUrl: "https://proxy.example.com/v1" }))).toBe(false);
+		expect(
+			shouldUseOpenAiRemoteCompaction(
+				makeOpenAiModel({
+					provider: "openai-codex",
+					baseUrl: "https://chatgpt.com/backend-api/codex",
+				}),
+			),
+		).toBe(true);
 	});
 });
 

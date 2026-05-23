@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenAI remote compaction being attempted for OpenAI-compatible proxy base URLs that do not expose `/responses/compact`, avoiding repeated 404 fallback noise while preserving remote compaction for first-party OpenAI and Codex endpoints.
+
 ## [15.2.3] - 2026-05-22
 ### Added
 

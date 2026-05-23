@@ -263,8 +263,9 @@ function containsAssistantOutputText(input: unknown[] | undefined, text: string)
 	return (input ?? []).some(item => {
 		if (!item || typeof item !== "object") return false;
 		const candidate = item as { type?: unknown; role?: unknown; content?: unknown };
-		if (candidate.type !== "message" || candidate.role !== "assistant" || !Array.isArray(candidate.content))
-			return false;
+		if (candidate.type !== "message" || candidate.role !== "assistant") return false;
+		if (candidate.content === text) return true;
+		if (!Array.isArray(candidate.content)) return false;
 		return candidate.content.some(part => {
 			if (!part || typeof part !== "object") return false;
 			const content = part as { type?: unknown; text?: unknown };
@@ -381,6 +382,95 @@ describe("OpenAI responses history payload", () => {
 		expect(containsAssistantOutputText(payload.input, "Canonical assistant")).toBe(false);
 	});
 
+	it("strips native item ids from rebuilt cold resume history while preserving call ids", async () => {
+		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			messages: [
+				{ role: "user", content: "first user", timestamp: Date.now() },
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "thinking",
+							thinking: "",
+							thinkingSignature: JSON.stringify({
+								type: "reasoning",
+								id: "rs_native_reasoning",
+								encrypted_content: "enc_native",
+							}),
+						},
+						{
+							type: "text",
+							text: "assistant text",
+							textSignature: JSON.stringify({ v: 1, id: "msg_native_message", phase: "final_answer" }),
+						},
+						{
+							type: "toolCall",
+							id: "call_read|fc_native_function",
+							name: "read",
+							arguments: { path: "README.md" },
+						},
+						{
+							type: "toolCall",
+							id: "call_edit|ctc_native_custom",
+							name: "edit",
+							arguments: { input: "*** Begin Patch\n*** End Patch\n" },
+							customWireName: "apply_patch",
+						},
+					],
+					api: "openai-responses",
+					provider: "openai",
+					model: "gpt-5-mini",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_read|fc_native_function",
+					toolName: "read",
+					content: [{ type: "text", text: "read output" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_edit|ctc_native_custom",
+					toolName: "edit",
+					content: [{ type: "text", text: "patch output" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "follow-up", timestamp: Date.now() },
+			],
+		};
+
+		const payload = (await captureResponsesPayload(model, context, providerSessionState)) as { input?: unknown[] };
+		const assistantMessage = findResponsesInputItem(payload.input, "message");
+		const functionCall = findResponsesInputItem(payload.input, "function_call");
+		const customCall = findResponsesInputItem(payload.input, "custom_tool_call");
+		const functionOutput = findResponsesInputItem(payload.input, "function_call_output");
+		const customOutput = findResponsesInputItem(payload.input, "custom_tool_call_output");
+
+		expect(containsEncryptedReasoning(payload.input)).toBe(false);
+		expect(assistantMessage?.id).toBeUndefined();
+		expect(assistantMessage?.phase).toBe("final_answer");
+		expect(functionCall?.id).toBeUndefined();
+		expect(functionCall?.call_id).toBe("call_read");
+		expect(customCall?.id).toBeUndefined();
+		expect(customCall?.call_id).toBe("call_edit");
+		expect(functionOutput?.call_id).toBe("call_read");
+		expect(customOutput?.call_id).toBe("call_edit");
+	});
+
 	it("does not replay stale thinking signatures when native replay is cold", async () => {
 		const model = getOpenAIReasoningModel("openai", "gpt-5-mini");
 		const providerSessionState = new Map<string, ProviderSessionState>();
@@ -413,9 +503,7 @@ describe("OpenAI responses history payload", () => {
 			{
 				type: "message",
 				role: "assistant",
-				content: [{ type: "output_text", text: "generic assistant that should be preserved", annotations: [] }],
-				status: "completed",
-				id: "msg_1",
+				content: "generic assistant that should be preserved",
 			},
 			{ role: "user", content: [{ type: "input_text", text: "follow-up user" }] },
 		]);

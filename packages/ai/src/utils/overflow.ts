@@ -52,6 +52,13 @@ const OVERFLOW_PATTERNS = [
 	/\b413\b.*\b(request|payload|entity)\b.*\btoo large\b/i, // "413 Request Entity Too Large" variants
 	/model_context_window_exceeded/i, // z.ai non-standard finish_reason surfaced as error text
 ];
+
+const NO_BODY_400_OVERFLOW_PATTERN = /\b400\s*(status code)?\s*\(no body\)/i;
+const NO_BODY_413_OVERFLOW_PATTERN = /\b413\s*(status code)?\s*\(no body\)/i;
+
+function providerMayUseNoBody400ForOverflow(message: AssistantMessage): boolean {
+	return message.api !== "openai-responses" && message.api !== "openai-codex-responses";
+}
 /**
  * Check if an assistant message represents a context overflow error.
  *
@@ -109,11 +116,13 @@ export function isContextOverflow(message: AssistantMessage, contextWindow?: num
 		}
 
 		// Cerebras and Mistral return 400/413 with no body for context overflow.
-		// Proxy providers (e.g. api.synthetic.new) wrap upstream 400/413 no-body
-		// responses in a JSON envelope, so the status code phrase may appear
-		// anywhere in the message rather than at its start.
+		// OpenAI Responses gateways also use 400/no-body for schema/history
+		// validation failures, so only 413/no-body is provider-agnostic.
 		// Note: 429 is rate limiting (requests/tokens per time), NOT context overflow
-		if (/\b4(00|13)\s*(status code)?\s*\(no body\)/i.test(message.errorMessage)) {
+		if (NO_BODY_413_OVERFLOW_PATTERN.test(message.errorMessage)) {
+			return true;
+		}
+		if (NO_BODY_400_OVERFLOW_PATTERN.test(message.errorMessage) && providerMayUseNoBody400ForOverflow(message)) {
 			return true;
 		}
 	}

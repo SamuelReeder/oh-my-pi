@@ -69,7 +69,15 @@ export interface RemoteCompactionResponse {
 // ============================================================================
 
 export function shouldUseOpenAiRemoteCompaction(model: Model): boolean {
-	return model.provider === "openai" || model.provider === "openai-codex";
+	if (model.provider === "openai-codex") return true;
+	if (model.provider !== "openai") return false;
+	return isOpenAiApiBaseUrl(model.baseUrl);
+}
+
+function isOpenAiApiBaseUrl(baseUrl: string | undefined): boolean {
+	if (!baseUrl || baseUrl.length === 0) return true;
+	const normalized = baseUrl.toLowerCase();
+	return normalized === "https://api.openai.com" || normalized.startsWith("https://api.openai.com/");
 }
 
 function resolveOpenAiCompactEndpoint(model: Model): string {

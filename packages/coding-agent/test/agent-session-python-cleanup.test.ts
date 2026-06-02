@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -91,6 +91,15 @@ const mockPositiveSleepsImmediate = () => {
 		}
 		return realSleep(duration ?? 0);
 	});
+};
+
+const expectSleepNear = (sleepSpy: Mock<typeof Bun.sleep>, targetMs: number) => {
+	const minMs = targetMs - 100;
+	expect(
+		sleepSpy.mock.calls.some(
+			([duration]) => typeof duration === "number" && duration >= minMs && duration <= targetMs,
+		),
+	).toBe(true);
 };
 const createSession = async (
 	tempDir: string,
@@ -415,7 +424,7 @@ describe("AgentSession python cleanup", () => {
 
 		const [toolResult] = await Promise.all([toolExecution, disposeSession]);
 
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expectSleepNear(sleepSpy, 3000);
 
 		expect(disposed).toBe(true);
 		expect(toolExecutionSettled).toBe(true);
@@ -460,7 +469,7 @@ describe("AgentSession python cleanup", () => {
 			firstDisposed = true;
 		});
 		await disposeFirst;
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expectSleepNear(sleepSpy, 3000);
 
 		expect(firstDisposed).toBe(true);
 		expect(firstExecutionSettled).toBe(false);
@@ -681,33 +690,39 @@ describe("AgentSession python cleanup", () => {
 		expect(executeSpy).not.toHaveBeenCalled();
 	});
 
-	it("aborts every active Python execution owned by the session during dispose", async () => {
+	it("aborts every active concurrent Python execution owned by the session during dispose", async () => {
 		const { tempDir, cwd } = createTempProject();
 		tempDirs.push(tempDir);
 		const kernel = new FakeKernel();
 		const blockedExecution = Promise.withResolvers<typeof OK_EXECUTION>();
-		const blockedExecutionStarted = Promise.withResolvers<void>();
-		kernel.blockedCode = "print('first')";
+		const bothStarted = Promise.withResolvers<void>();
+		let starts = 0;
+		kernel.blockedCode = "print('blocked')";
 		kernel.blockedExecution = blockedExecution.promise;
-		kernel.blockedExecutionStarted = () => blockedExecutionStarted.resolve();
+		kernel.blockedExecutionStarted = () => {
+			starts += 1;
+			if (starts >= 2) bothStarted.resolve();
+		};
 
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
 		vi.spyOn(pythonKernel.PythonKernel, "start").mockResolvedValue(kernel as unknown as PythonKernelInstance);
 
 		const session = await createSession(tempDir, cwd);
 
-		const firstExecution = session.executePython("print('first')");
-		await blockedExecutionStarted.promise;
-		const secondExecution = session.executePython("print('second')");
+		// Two concurrent blocked executions on the shared kernel session: both must
+		// be tracked when dispose runs so abortEval cancels every signal.
+		const firstExecution = session.executePython("print('blocked')");
+		const secondExecution = session.executePython("print('blocked')");
+		await bothStarted.promise;
 		const sleepSpy = mockPositiveSleepsImmediate();
 
 		await session.dispose();
-		expect(sleepSpy).toHaveBeenCalledWith(3000);
+		expectSleepNear(sleepSpy, 3000);
 		const [firstResult, secondResult] = await Promise.all([firstExecution, secondExecution]);
 
 		expect(firstResult.cancelled).toBe(true);
 		expect(secondResult.cancelled).toBe(true);
-		expect(kernel.executeCalls).toEqual(["print('first')"]);
+		expect(kernel.executeCalls).toEqual(["print('blocked')", "print('blocked')"]);
 		expect(kernel.shutdownCalls).toBe(1);
 	});
 });

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import type Anthropic from "@anthropic-ai/sdk";
 import { streamAnthropic } from "../src/providers/anthropic";
+import type { AnthropicMessagesClientLike } from "../src/providers/anthropic-client";
 import type { Context, Model } from "../src/types";
 import { waitForDelayOrAbort } from "./helpers";
+
+const originalFetch = global.fetch;
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -133,20 +135,28 @@ function createAnthropicMockStream({
 }
 
 afterEach(() => {
-	// No shared globals to restore; keep hook so the suite stays explicit.
+	global.fetch = originalFetch;
+	vi.restoreAllMocks();
 });
 
 describe("anthropic first-event timeout retries", () => {
 	it("retries when the provider never sends the first stream event", async () => {
 		let attempt = 0;
-		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+		const requestTimeouts: Array<number | undefined> = [];
+		const requestMaxRetries: Array<number | undefined> = [];
+		const create = ((
+			_body: unknown,
+			requestOptions?: { signal?: AbortSignal; timeout?: number; maxRetries?: number },
+		) => {
 			attempt += 1;
+			requestTimeouts.push(requestOptions?.timeout);
+			requestMaxRetries.push(requestOptions?.maxRetries);
 			return createAnthropicMockStream({
 				signal: requestOptions?.signal,
 				events: attempt === 1 ? undefined : createSuccessfulAnthropicEvents("retry recovered"),
 			}) as never;
-		}) as unknown as Anthropic["messages"]["create"];
-		const client = { messages: { create } } as Anthropic;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
 		const providerRetryWait = vi.fn(async () => {});
 
 		const result = await streamAnthropic(model, context, {
@@ -157,37 +167,81 @@ describe("anthropic first-event timeout retries", () => {
 
 		expect(attempt).toBe(2);
 		expect(providerRetryWait).toHaveBeenCalledWith(2000, undefined);
+		expect(requestTimeouts).toEqual([1, 1]);
+		expect(requestMaxRetries).toEqual([0, 0]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "retry recovered" }]);
 		expect(result.responseId).toBe("msg_retry_success");
 	});
 
 	it("does not arm the Anthropic first-event watchdog before the stream connects", async () => {
-		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
+		let seenRequestTimeout: number | undefined;
+		let seenRequestMaxRetries: number | undefined;
+		const create = ((
+			_body: unknown,
+			requestOptions?: { signal?: AbortSignal; timeout?: number; maxRetries?: number },
+		) => {
+			seenRequestTimeout = requestOptions?.timeout;
+			seenRequestMaxRetries = requestOptions?.maxRetries;
 			return createAnthropicMockStream({
 				signal: requestOptions?.signal,
 				connectDelayMs: 2,
 				events: createSuccessfulAnthropicEvents("delayed connect"),
 			}) as never;
-		}) as unknown as Anthropic["messages"]["create"];
-		const client = { messages: { create } } as Anthropic;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+
+		const result = await streamAnthropic(model, context, {
+			client,
+			streamFirstEventTimeoutMs: 20,
+		}).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(seenRequestTimeout).toBe(20);
+		expect(seenRequestMaxRetries).toBe(0);
+		expect(result.content).toEqual([{ type: "text", text: "delayed connect" }]);
+	});
+
+	it("times out before the Anthropic stream connects and forwards the budget to the SDK request", async () => {
+		let attempt = 0;
+		const requestTimeouts: Array<number | undefined> = [];
+		const requestMaxRetries: Array<number | undefined> = [];
+		const create = ((
+			_body: unknown,
+			requestOptions?: { signal?: AbortSignal; timeout?: number; maxRetries?: number },
+		) => {
+			attempt += 1;
+			requestTimeouts.push(requestOptions?.timeout);
+			requestMaxRetries.push(requestOptions?.maxRetries);
+			return createAnthropicMockStream({
+				signal: requestOptions?.signal,
+				connectDelayMs: 20,
+				events: createSuccessfulAnthropicEvents("too late"),
+			}) as never;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+		const providerRetryWait = vi.fn(async () => {});
 
 		const result = await streamAnthropic(model, context, {
 			client,
 			streamFirstEventTimeoutMs: 1,
+			providerRetryWait,
 		}).result();
 
-		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "delayed connect" }]);
+		expect(attempt).toBe(4);
+		expect(providerRetryWait).toHaveBeenCalledTimes(3);
+		expect(requestTimeouts).toEqual([1, 1, 1, 1]);
+		expect(requestMaxRetries).toEqual([0, 0, 0, 0]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic stream timed out while waiting for the first event");
 	});
-
 	it("keeps caller aborts as aborted instead of retrying them as first-event timeouts", async () => {
 		let attempt = 0;
 		const create = ((_body: unknown, requestOptions?: { signal?: AbortSignal }) => {
 			attempt += 1;
 			return createAnthropicMockStream({ signal: requestOptions?.signal }) as never;
-		}) as unknown as Anthropic["messages"]["create"];
-		const client = { messages: { create } } as Anthropic;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
 
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 1);
@@ -235,16 +289,19 @@ describe("anthropic first-event timeout retries", () => {
 				],
 				hangAfterEvents: true,
 			}) as never;
-		}) as unknown as Anthropic["messages"]["create"];
-		const client = { messages: { create } } as Anthropic;
+		}) as unknown as AnthropicMessagesClientLike["messages"]["create"];
+		const client = { messages: { create } } as AnthropicMessagesClientLike;
+		const providerRetryWait = vi.fn(async () => {});
 
 		const result = await streamAnthropic(model, context, {
 			client,
-			streamFirstEventTimeoutMs: 10,
-			streamIdleTimeoutMs: 1,
+			streamFirstEventTimeoutMs: 5000,
+			streamIdleTimeoutMs: 50,
+			providerRetryWait,
 		}).result();
 
 		expect(attempt).toBe(1);
+		expect(providerRetryWait).not.toHaveBeenCalled();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Anthropic stream stalled while waiting for the next event");
 		expect(result.content).toEqual([

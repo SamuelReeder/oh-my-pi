@@ -1,9 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import { SqliteAuthCredentialStore } from "../src/auth-storage";
-import { buildAnthropicUrl, findAnthropicAuth } from "../src/utils/anthropic-auth";
+import { buildAnthropicAuthConfig, buildAnthropicSearchHeaders, buildAnthropicUrl } from "../src/utils/anthropic-auth";
 import { AnthropicOAuthFlow, refreshAnthropicToken } from "../src/utils/oauth/anthropic";
 import { withEnv } from "./helpers";
 
@@ -24,7 +20,9 @@ describe("anthropic oauth alignment", () => {
 		const authUrl = new URL(url);
 
 		expect(authUrl.origin + authUrl.pathname).toBe("https://claude.ai/oauth/authorize");
-		expect(authUrl.searchParams.get("scope")).toBe("org:create_api_key user:profile user:inference");
+		expect(authUrl.searchParams.get("scope")).toBe(
+			"org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
+		);
 		expect(authUrl.searchParams.get("state")).toBe(state);
 		expect(authUrl.searchParams.get("redirect_uri")).toBe(redirectUri);
 		expect(authUrl.searchParams.get("code_challenge_method")).toBe("S256");
@@ -39,6 +37,10 @@ describe("anthropic oauth alignment", () => {
 					access_token: "access-token",
 					refresh_token: "refresh-token",
 					expires_in: 3600,
+					account: {
+						uuid: "11111111-2222-3333-4444-555555555555",
+						email_address: "user@example.com",
+					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -66,6 +68,10 @@ describe("anthropic oauth alignment", () => {
 					access_token: "access-token",
 					refresh_token: "refresh-token",
 					expires_in: 3600,
+					account: {
+						uuid: "11111111-2222-3333-4444-555555555555",
+						email_address: "user@example.com",
+					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -89,6 +95,10 @@ describe("anthropic oauth alignment", () => {
 					access_token: "access-token",
 					refresh_token: "refresh-token",
 					expires_in: 3600,
+					account: {
+						uuid: "11111111-2222-3333-4444-555555555555",
+						email_address: "user@example.com",
+					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -101,15 +111,22 @@ describe("anthropic oauth alignment", () => {
 
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
-	it("uses api.anthropic.com token URL for refresh", async () => {
+	it("uses api.anthropic.com token URL and CC headers for refresh", async () => {
 		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
 			expect(typeof input === "string" ? input : input.toString()).toBe("https://api.anthropic.com/v1/oauth/token");
 			expect(init?.method).toBe("POST");
+			const headers = init?.headers as Record<string, string> | undefined;
+			expect(headers?.["anthropic-beta"]).toBe("oauth-2025-04-20");
+			expect(headers?.["User-Agent"]).toBe("anthropic-sdk-typescript/0.94.0 userOAuthProvider");
 			return new Response(
 				JSON.stringify({
 					access_token: "new-access-token",
 					refresh_token: "new-refresh-token",
 					expires_in: 7200,
+					account: {
+						uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+						email_address: "refreshed@example.com",
+					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -172,13 +189,31 @@ describe("anthropic oauth alignment", () => {
 		expect(result.email).toBe("refreshed@example.com");
 	});
 
-	it("leaves accountId/email undefined when token response omits account block", async () => {
-		const fetchMock = vi.fn(async () => {
+	it("fetches bootstrap identity when token response omits account block", async () => {
+		const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.anthropic.com/v1/oauth/token") {
+				return new Response(
+					JSON.stringify({
+						access_token: "access-token",
+						refresh_token: "refresh-token",
+						expires_in: 3600,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			expect(url).toBe("https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=cli&model=claude-opus-4-8");
+			expect(init?.method).toBe("GET");
+			const headers = init?.headers as Record<string, string> | undefined;
+			expect(headers?.Authorization).toBe("Bearer access-token");
+			expect(headers?.["User-Agent"]).toBe("claude-code/2.1.160");
+			expect(headers?.["anthropic-beta"]).toBe("oauth-2025-04-20");
 			return new Response(
 				JSON.stringify({
-					access_token: "access-token",
-					refresh_token: "refresh-token",
-					expires_in: 3600,
+					oauth_account: {
+						account_uuid: "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+						account_email: "bootstrap@example.com",
+					},
 				}),
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
@@ -189,100 +224,170 @@ describe("anthropic oauth alignment", () => {
 		await flow.generateAuthUrl("state-noaccount", "http://localhost:54545/callback");
 		const result = await flow.exchangeToken("code-noaccount", "state-noaccount", "http://localhost:54545/callback");
 
+		expect(result.accountId).toBe("bbbbbbbb-cccc-dddd-eeee-ffffffffffff");
+		expect(result.email).toBe("bootstrap@example.com");
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("leaves accountId/email undefined when token and bootstrap responses omit identity", async () => {
+		const fetchMock = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.anthropic.com/v1/oauth/token") {
+				return new Response(
+					JSON.stringify({
+						access_token: "access-token",
+						refresh_token: "refresh-token",
+						expires_in: 3600,
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			return new Response(JSON.stringify({ client_data: null }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+		global.fetch = fetchMock as unknown as typeof fetch;
+
+		const flow = new AnthropicOAuthFlow({});
+		await flow.generateAuthUrl("state-noaccount", "http://localhost:54545/callback");
+		const result = await flow.exchangeToken("code-noaccount", "state-noaccount", "http://localhost:54545/callback");
+
 		expect(result.accountId).toBeUndefined();
 		expect(result.email).toBeUndefined();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 });
 
-describe("anthropic auth resolution", () => {
-	it("prefers explicit Foundry env key over stored OAuth and normalizes Foundry base URL", async () => {
-		const tmpDir = path.join(os.tmpdir(), `pi-ai-auth-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-		fs.mkdirSync(tmpDir, { recursive: true });
-		const dbPath = path.join(tmpDir, "agent.db");
-		const store = await SqliteAuthCredentialStore.open(dbPath);
-		try {
-			store.replaceAuthCredentialsForProvider("anthropic", [
-				{ type: "oauth", access: "sk-ant-oat-db", refresh: "refresh", expires: Date.now() + 20 * 60 * 1000 },
-			]);
-			await withEnv(
-				{
-					CLAUDE_CODE_USE_FOUNDRY: "true",
-					ANTHROPIC_FOUNDRY_API_KEY: "foundry-explicit-key",
-					FOUNDRY_BASE_URL: "https://foundry.example.com/anthropic/",
-					ANTHROPIC_API_KEY: undefined,
-					ANTHROPIC_OAUTH_TOKEN: undefined,
-				},
-				async () => {
-					const auth = await findAnthropicAuth(store);
-					expect(auth).not.toBeNull();
-					expect(auth?.apiKey).toBe("foundry-explicit-key");
-					expect(auth?.isOAuth).toBe(false);
-					expect(auth?.baseUrl).toBe("https://foundry.example.com/anthropic");
-					expect(buildAnthropicUrl(auth!)).toBe("https://foundry.example.com/anthropic/v1/messages?beta=true");
-				},
-			);
-		} finally {
-			store.close();
-			fs.rmSync(tmpDir, { recursive: true, force: true });
-		}
+describe("buildAnthropicAuthConfig", () => {
+	it("classifies sk-ant-oat tokens as OAuth", () => {
+		const config = buildAnthropicAuthConfig("sk-ant-oat-foobar");
+		expect(config.isOAuth).toBe(true);
+		expect(config.apiKey).toBe("sk-ant-oat-foobar");
 	});
 
-	it("keeps non-Foundry OAuth precedence unchanged", async () => {
-		const tmpDir = path.join(os.tmpdir(), `pi-ai-auth-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-		fs.mkdirSync(tmpDir, { recursive: true });
-		const dbPath = path.join(tmpDir, "agent.db");
-		const store = await SqliteAuthCredentialStore.open(dbPath);
-		try {
-			store.replaceAuthCredentialsForProvider("anthropic", [
-				{ type: "oauth", access: "sk-ant-oat-db", refresh: "refresh", expires: Date.now() + 20 * 60 * 1000 },
-			]);
-			await withEnv(
-				{
-					CLAUDE_CODE_USE_FOUNDRY: undefined,
-					ANTHROPIC_FOUNDRY_API_KEY: "foundry-explicit-key",
-					ANTHROPIC_API_KEY: "sk-ant-api-env",
-					ANTHROPIC_OAUTH_TOKEN: undefined,
-				},
-				async () => {
-					const auth = await findAnthropicAuth(store);
-					expect(auth).not.toBeNull();
-					expect(auth?.apiKey).toBe("sk-ant-oat-db");
-					expect(auth?.isOAuth).toBe(true);
-					expect(auth?.baseUrl).toBe("https://api.anthropic.com");
-				},
-			);
-		} finally {
-			store.close();
-			fs.rmSync(tmpDir, { recursive: true, force: true });
-		}
+	it("treats sk-ant-api tokens as non-OAuth", () => {
+		const config = buildAnthropicAuthConfig("sk-ant-api-foobar");
+		expect(config.isOAuth).toBe(false);
 	});
 
-	it("prefers stored API key over generic env fallback", async () => {
-		const tmpDir = path.join(os.tmpdir(), `pi-ai-auth-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-		fs.mkdirSync(tmpDir, { recursive: true });
-		const dbPath = path.join(tmpDir, "agent.db");
-		const store = await SqliteAuthCredentialStore.open(dbPath);
-		try {
-			store.replaceAuthCredentialsForProvider("anthropic", [{ type: "api_key", key: "sk-ant-api-db" }]);
-			await withEnv(
-				{
-					CLAUDE_CODE_USE_FOUNDRY: undefined,
-					ANTHROPIC_FOUNDRY_API_KEY: undefined,
-					ANTHROPIC_API_KEY: "sk-ant-api-env",
-					ANTHROPIC_BASE_URL: "https://anthropic.example.com/",
-					ANTHROPIC_OAUTH_TOKEN: undefined,
-				},
-				async () => {
-					const auth = await findAnthropicAuth(store);
-					expect(auth).not.toBeNull();
-					expect(auth?.apiKey).toBe("sk-ant-api-db");
-					expect(auth?.isOAuth).toBe(false);
-					expect(auth?.baseUrl).toBe("https://anthropic.example.com");
-				},
-			);
-		} finally {
-			store.close();
-			fs.rmSync(tmpDir, { recursive: true, force: true });
-		}
+	it("normalizes the explicit baseUrl override (trailing slash, env precedence)", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: "true",
+				FOUNDRY_BASE_URL: "https://foundry.example.com/anthropic/",
+				ANTHROPIC_BASE_URL: undefined,
+			},
+			async () => {
+				const explicit = buildAnthropicAuthConfig("sk-ant-api-key", "https://override.example.com/");
+				expect(explicit.baseUrl).toBe("https://override.example.com");
+				expect(buildAnthropicUrl(explicit)).toBe("https://override.example.com/v1/messages?beta=true");
+			},
+		);
+	});
+
+	it("falls back to FOUNDRY_BASE_URL when Foundry mode is enabled and no explicit override is given", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: "true",
+				FOUNDRY_BASE_URL: "https://foundry.example.com/anthropic/",
+				ANTHROPIC_BASE_URL: undefined,
+			},
+			async () => {
+				const config = buildAnthropicAuthConfig("sk-ant-api-key");
+				expect(config.baseUrl).toBe("https://foundry.example.com/anthropic");
+			},
+		);
+	});
+
+	it("falls back to ANTHROPIC_BASE_URL when Foundry mode is disabled", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: undefined,
+				FOUNDRY_BASE_URL: undefined,
+				ANTHROPIC_BASE_URL: "https://anthropic.example.com/",
+			},
+			async () => {
+				const config = buildAnthropicAuthConfig("sk-ant-api-key");
+				expect(config.baseUrl).toBe("https://anthropic.example.com");
+			},
+		);
+	});
+
+	it("uses the default Anthropic base URL when no env or override is set", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: undefined,
+				FOUNDRY_BASE_URL: undefined,
+				ANTHROPIC_BASE_URL: undefined,
+			},
+			async () => {
+				const config = buildAnthropicAuthConfig("sk-ant-api-key");
+				expect(config.baseUrl).toBe("https://api.anthropic.com");
+			},
+		);
+	});
+});
+
+describe("buildAnthropicSearchHeaders", () => {
+	it("forwards ANTHROPIC_CUSTOM_HEADERS when the base URL is an enterprise gateway", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: undefined,
+				FOUNDRY_BASE_URL: undefined,
+				ANTHROPIC_BASE_URL: "https://gateway.example.com",
+				ANTHROPIC_CUSTOM_HEADERS: "X-Gateway-Key: secret, X-Route: search",
+			},
+			() => {
+				const auth = buildAnthropicAuthConfig("sk-ant-api-key");
+				expect(auth.baseUrl).toBe("https://gateway.example.com");
+				const headers = buildAnthropicSearchHeaders(auth);
+				expect(headers["X-Gateway-Key"]).toBe("secret");
+				expect(headers["X-Route"]).toBe("search");
+				// Non-Anthropic base URL uses Bearer auth, not X-Api-Key.
+				expect(headers.Authorization).toBe("Bearer sk-ant-api-key");
+				expect(headers["X-Api-Key"]).toBeUndefined();
+			},
+		);
+	});
+
+	it("omits ANTHROPIC_CUSTOM_HEADERS when targeting api.anthropic.com without Foundry", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: undefined,
+				FOUNDRY_BASE_URL: undefined,
+				ANTHROPIC_BASE_URL: undefined,
+				ANTHROPIC_CUSTOM_HEADERS: "X-Gateway-Key: secret",
+			},
+			() => {
+				const auth = buildAnthropicAuthConfig("sk-ant-api-key");
+				expect(auth.baseUrl).toBe("https://api.anthropic.com");
+				const headers = buildAnthropicSearchHeaders(auth);
+				expect(headers["X-Gateway-Key"]).toBeUndefined();
+				expect(headers["X-Api-Key"]).toBe("sk-ant-api-key");
+			},
+		);
+	});
+
+	it("forwards ANTHROPIC_CUSTOM_HEADERS in Foundry mode even on an Anthropic-shaped base URL", async () => {
+		await withEnv(
+			{
+				CLAUDE_CODE_USE_FOUNDRY: "true",
+				FOUNDRY_BASE_URL: undefined,
+				ANTHROPIC_BASE_URL: undefined,
+				ANTHROPIC_CUSTOM_HEADERS: "user-id: alice",
+			},
+			() => {
+				const auth = buildAnthropicAuthConfig("sk-ant-api-key", "https://api.anthropic.com");
+				const headers = buildAnthropicSearchHeaders(auth);
+				expect(headers["user-id"]).toBe("alice");
+			},
+		);
+	});
+
+	it("includes the web-search beta in Anthropic-Beta", () => {
+		const auth = buildAnthropicAuthConfig("sk-ant-api-key");
+		const headers = buildAnthropicSearchHeaders(auth);
+		expect(headers["Anthropic-Beta"]).toContain("web-search-2025-03-05");
 	});
 });

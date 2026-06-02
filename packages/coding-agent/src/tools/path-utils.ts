@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { InternalUrlRouter } from "../internal-urls";
+import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -28,7 +28,15 @@ const INTERNAL_SCHEMES_WITH_SELECTORS: Record<string, true> = {
 	pr: true,
 	rule: true,
 	skill: true,
+	vault: true,
 };
+// Schemes whose resource URIs are server-defined and may legitimately end
+// with selector-shaped tails (e.g. `:raw`, `:conflicts`, `:1-50`, `/:raw`).
+// `McpProtocolHandler` resolves by exact URI match (`r.uri === uri`), so
+// peeling syntactically can make valid resources unreachable. Keep these
+// schemes opaque; selector support for them needs a resolver-aware path that
+// tries the exact URI before interpreting any suffix as a read selector.
+const OPAQUE_RESOURCE_SCHEMES: ReadonlySet<string> = new Set(["mcp"]);
 const INTERNAL_URL_SCHEME_RE = /^([a-z][a-z0-9+.-]*):\/\//i;
 const NARROW_NO_BREAK_SPACE = "\u202F";
 const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
@@ -38,6 +46,7 @@ const TOP_LEVEL_INTERNAL_URL_PREFIXES = [
 	"rule://",
 	"local://",
 	"mcp://",
+	"vault://",
 ] as const;
 
 function normalizeUnicodeSpaces(str: string): string {
@@ -126,6 +135,87 @@ export function expandPath(filePath: string): string {
 	const normalized = stripFileUrl(normalizeUnicodeSpaces(normalizeAtPrefix(filePath)));
 	return expandTilde(normalized);
 }
+/**
+ * Inclusive line range describing one selector segment (e.g. `50-100`,
+ * `301-`, or `50+10`). `endLine` is `undefined` for open-ended ranges.
+ */
+export interface LineRange {
+	startLine: number;
+	endLine: number | undefined;
+}
+
+const LINE_RANGE_CHUNK_RE = /^L?(\d+)(?:([-+])L?(\d+)?)?$/i;
+
+/** Parse a single `N`, `N-M`, `N-`, or `N+K` chunk. Throws via {@link ToolError} on invalid bounds. */
+export function parseLineRangeChunk(sel: string): LineRange | null {
+	const lineMatch = LINE_RANGE_CHUNK_RE.exec(sel);
+	if (!lineMatch) return null;
+	const rawStart = Number.parseInt(lineMatch[1]!, 10);
+	if (rawStart < 1) {
+		throw new ToolError("Line selector 0 is invalid; lines are 1-indexed. Use :1.");
+	}
+	const sep = lineMatch[2];
+	const rhs = lineMatch[3] ? Number.parseInt(lineMatch[3], 10) : undefined;
+	let rawEnd: number | undefined;
+	if (sep === "+") {
+		if (rhs === undefined || rhs < 1) {
+			throw new ToolError(`Invalid range ${rawStart}+${rhs ?? 0}: count must be >= 1.`);
+		}
+		rawEnd = rawStart + rhs - 1;
+	} else if (sep === "-") {
+		// `301-` is shorthand for "from 301 onward" — equivalent to bare `301`.
+		if (rhs !== undefined) {
+			if (rhs < rawStart) {
+				throw new ToolError(`Invalid range ${rawStart}-${rhs}: end must be >= start.`);
+			}
+			rawEnd = rhs;
+		}
+	}
+	return { startLine: rawStart, endLine: rawEnd };
+}
+
+/**
+ * Parse a comma-separated list of line ranges (e.g. `5-16,960-973`). Returns
+ * the ranges in ascending order with overlapping/adjacent ranges merged so
+ * downstream consumers can stream the file in a single forward pass per range.
+ */
+export function parseLineRanges(sel: string): [LineRange, ...LineRange[]] | null {
+	const chunks = sel.split(",");
+	const parsed: LineRange[] = [];
+	for (const chunk of chunks) {
+		const range = parseLineRangeChunk(chunk);
+		if (!range) return null;
+		parsed.push(range);
+	}
+	if (parsed.length === 0) return null;
+	parsed.sort((a, b) => a.startLine - b.startLine);
+
+	const merged: LineRange[] = [parsed[0]];
+	for (let i = 1; i < parsed.length; i++) {
+		const current = parsed[i];
+		const last = merged[merged.length - 1];
+		// Open-ended (endLine undefined) means "to EOF" — any later range is absorbed.
+		if (last.endLine === undefined) continue;
+		// Merge when current starts within (or immediately after) the last range.
+		if (current.startLine <= last.endLine + 1) {
+			if (current.endLine === undefined || current.endLine > last.endLine) {
+				merged[merged.length - 1] = { startLine: last.startLine, endLine: current.endLine };
+			}
+			continue;
+		}
+		merged.push(current);
+	}
+	return merged as [LineRange, ...LineRange[]];
+}
+
+/** Return `true` when `lineNumber` (1-indexed) falls in any of the supplied ranges. */
+export function isLineInRanges(lineNumber: number, ranges: readonly LineRange[]): boolean {
+	for (const range of ranges) {
+		if (lineNumber < range.startLine) continue;
+		if (range.endLine === undefined || lineNumber <= range.endLine) return true;
+	}
+	return false;
+}
 
 export function splitPathAndSel(rawPath: string): { path: string; sel?: string } {
 	const colon = rawPath.lastIndexOf(":");
@@ -173,10 +263,16 @@ export function splitPathAndSel(rawPath: string): { path: string; sel?: string }
  *
  * Falls back to the input unchanged when nothing matches.
  */
+
 export function splitInternalUrlSel(rawPath: string): { path: string; sel?: string } {
 	const schemeMatch = rawPath.match(INTERNAL_URL_SCHEME_RE);
 	if (!schemeMatch) return { path: rawPath };
-	if (!INTERNAL_SCHEMES_WITH_SELECTORS[schemeMatch[1].toLowerCase()]) return { path: rawPath };
+	const scheme = schemeMatch[1].toLowerCase();
+	// Opaque schemes (mcp://, etc.) carry server-defined resource URIs that may
+	// legitimately end in selector-shaped tails. Forward verbatim — see
+	// OPAQUE_RESOURCE_SCHEMES.
+	if (OPAQUE_RESOURCE_SCHEMES.has(scheme)) return { path: rawPath };
+	if (!INTERNAL_SCHEMES_WITH_SELECTORS[scheme]) return { path: rawPath };
 
 	const schemeEnd = schemeMatch[0].length;
 	let path = rawPath;
@@ -281,6 +377,145 @@ const GLOB_PATH_CHARS = ["*", "?", "[", "{"] as const;
 
 export function hasGlobPathChars(filePath: string): boolean {
 	return GLOB_PATH_CHARS.some(char => filePath.includes(char));
+}
+
+type PathEntrySplitter = (item: string) => { basePath: string };
+
+const TOP_LEVEL_WHITESPACE_RE = /\s/;
+
+type DelimitedPathSplitMode = "comma" | "semicolon" | "whitespace" | "mixed";
+
+function isDelimitedPathSeparator(ch: string, mode: DelimitedPathSplitMode): boolean {
+	if (mode === "comma") return ch === ",";
+	if (mode === "semicolon") return ch === ";";
+	if (mode === "whitespace") return TOP_LEVEL_WHITESPACE_RE.test(ch);
+	return ch === "," || ch === ";" || TOP_LEVEL_WHITESPACE_RE.test(ch);
+}
+
+function hasTopLevelPathDelimiter(entry: string): boolean {
+	let braceDepth = 0;
+	for (let i = 0; i < entry.length; i++) {
+		const ch = entry[i];
+		if (ch === "\\" && i + 1 < entry.length) {
+			i++;
+			continue;
+		}
+		if (ch === "{") {
+			braceDepth++;
+			continue;
+		}
+		if (ch === "}") {
+			if (braceDepth > 0) braceDepth--;
+			continue;
+		}
+		if (braceDepth === 0 && (ch === "," || ch === ";" || TOP_LEVEL_WHITESPACE_RE.test(ch))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode): string[] {
+	const parts: string[] = [];
+	let braceDepth = 0;
+	let start = 0;
+	for (let i = 0; i < entry.length; i++) {
+		const ch = entry[i];
+		if (ch === "\\" && i + 1 < entry.length) {
+			i++;
+			continue;
+		}
+		if (ch === "{") {
+			braceDepth++;
+			continue;
+		}
+		if (ch === "}") {
+			if (braceDepth > 0) braceDepth--;
+			continue;
+		}
+		if (braceDepth !== 0 || !isDelimitedPathSeparator(ch, mode)) continue;
+		parts.push(entry.slice(start, i));
+		start = i + 1;
+	}
+	parts.push(entry.slice(start));
+	return parts;
+}
+
+async function delimitedPathPartResolves(entry: string, cwd: string, splitter: PathEntrySplitter): Promise<boolean> {
+	if (isInternalUrlPath(entry)) return true;
+	const peeled = splitPathAndSel(entry).path;
+	const { basePath } = splitter(peeled);
+	const absoluteBasePath = resolveToCwd(basePath, cwd);
+	try {
+		await fs.promises.stat(absoluteBasePath);
+		return true;
+	} catch (err) {
+		if (isEnoent(err)) return false;
+		throw err;
+	}
+}
+
+async function tryDelimitedPathSplit(
+	entry: string,
+	cwd: string,
+	splitter: PathEntrySplitter,
+	mode: DelimitedPathSplitMode,
+	requireAllParts: boolean,
+): Promise<string[] | null> {
+	const rawParts = splitTopLevelDelimitedPath(entry, mode);
+	if (rawParts.length < 2) return null;
+
+	const parts = rawParts.map(normalizePathLikeInput).filter(part => part.length > 0);
+	if (parts.length === 0) return null;
+	if (parts.length < 2 && rawParts.length === parts.length) return null;
+
+	const resolved = await Promise.all(parts.map(part => delimitedPathPartResolves(part, cwd, splitter)));
+	const valid = requireAllParts ? resolved.every(Boolean) : resolved.some(Boolean);
+	return valid ? parts : null;
+}
+
+/**
+ * Split one path-like entry whose multiple targets were flattened into one
+ * string. Existing paths are kept intact, so real filenames containing spaces,
+ * commas, or semicolons win over delimiter recovery.
+ */
+export async function splitDelimitedPathEntry(
+	entry: string,
+	cwd: string,
+	options: { splitter?: PathEntrySplitter } = {},
+): Promise<string[] | null> {
+	const normalizedEntry = normalizePathLikeInput(entry);
+	if (!hasTopLevelPathDelimiter(normalizedEntry)) return null;
+	if (isInternalUrlPath(normalizedEntry)) return null;
+
+	const splitter = options.splitter ?? parseSearchPath;
+	const peeledEntry = splitPathAndSel(normalizedEntry).path;
+	if (!hasGlobPathChars(peeledEntry) && (await delimitedPathPartResolves(normalizedEntry, cwd, splitter))) {
+		return null;
+	}
+
+	return (
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "comma", false)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "semicolon", false)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "whitespace", true)) ??
+		(await tryDelimitedPathSplit(normalizedEntry, cwd, splitter, "mixed", true))
+	);
+}
+
+/** Expand delimited entries in-place while preserving unsplit entries. */
+export async function expandDelimitedPathEntries(
+	entries: readonly string[],
+	cwd: string,
+	options: { splitter?: PathEntrySplitter } = {},
+): Promise<string[]> {
+	const expanded: string[] = [];
+	for (const entry of entries) {
+		const normalizedEntry = normalizePathLikeInput(entry);
+		const split = await splitDelimitedPathEntry(normalizedEntry, cwd, options);
+		if (split) expanded.push(...split);
+		else expanded.push(normalizedEntry);
+	}
+	return expanded;
 }
 
 export interface ParsedSearchPath {
@@ -644,6 +879,12 @@ export interface ToolScopeOptions {
 	surfaceExactFilePaths?: boolean;
 	/** Extra hint appended to "Path not found" when stat fails and the user supplied multiple paths. */
 	multipathStatHint?: string;
+	/** Calling session's settings — forwarded to the internal-URL router so caller-aware handlers (issue://, pr://) honor it. */
+	settings?: unknown;
+	/** Caller's abort signal — forwarded to the internal-URL router. */
+	signal?: AbortSignal;
+	/** Calling session's `local://` root mapping — pins resolutions to the calling session. */
+	localProtocolOptions?: LocalProtocolOptions;
 }
 
 export interface ToolScopeResolution {
@@ -667,7 +908,11 @@ export interface ToolScopeResolution {
  */
 export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<ToolScopeResolution> {
 	const { rawPaths: inputs, cwd, internalUrlAction } = opts;
-	const rawPaths = inputs.map(normalizePathLikeInput);
+	const normalizedRawPaths = inputs.map(normalizePathLikeInput);
+	if (normalizedRawPaths.some(rawPath => rawPath.length === 0)) {
+		throw new ToolError("`paths` must contain non-empty paths or globs");
+	}
+	const rawPaths = await expandDelimitedPathEntries(normalizedRawPaths, cwd);
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("`paths` must contain non-empty paths or globs");
 	}
@@ -682,7 +927,12 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		if (hasGlobPathChars(rawPath)) {
 			throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
 		}
-		const resource = await internalRouter.resolve(rawPath);
+		const resource = await internalRouter.resolve(rawPath, {
+			cwd,
+			settings: opts.settings,
+			signal: opts.signal,
+			localProtocolOptions: opts.localProtocolOptions,
+		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}

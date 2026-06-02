@@ -11,6 +11,7 @@ export * from "./models";
 export * from "./provider-details";
 export * from "./provider-models";
 export * from "./providers/anthropic";
+export * from "./providers/anthropic-client";
 export * from "./providers/azure-openai-responses";
 export type * from "./providers/cursor";
 export * from "./providers/gitlab-duo";
@@ -40,7 +41,6 @@ export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
 export * from "./utils/discovery";
 export * from "./utils/event-stream";
-export * from "./utils/h2-fetch";
 export * from "./utils/oauth";
 export type {
 	OAuthCredentials,

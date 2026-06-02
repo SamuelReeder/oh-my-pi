@@ -90,6 +90,9 @@ export default class Index extends Command {
 			description: `Set thinking level: ${THINKING_EFFORTS.join(", ")}`,
 			options: [...THINKING_EFFORTS],
 		}),
+		"hide-thinking": Flags.boolean({
+			description: "Hide thinking blocks in TUI output (display only, does not disable model thinking)",
+		}),
 		hook: Flags.string({
 			description: "Load a hook/extension file (can be used multiple times)",
 			multiple: true,
@@ -119,6 +122,22 @@ export default class Index extends Command {
 		}),
 		"no-title": Flags.boolean({
 			description: "Disable title auto-generation",
+		}),
+		// `--auto-approve` / `--yolo`: declared here so oclif's auto-generated `--help` lists it.
+		// Runtime parsing happens in `cli/args.ts parseArgs` (line 176 in that file) — `runRootCommand`
+		// consumes the manual-parser output, not these oclif flag values. If you rename or remove
+		// either form, update both call sites in lockstep.
+		"auto-approve": Flags.boolean({
+			aliases: ["yolo"],
+			description: "Auto-approve all tool calls (skip approval prompts)",
+		}),
+		// `--approval-mode`: declared here so oclif's auto-generated `--help` lists it; runtime parsing
+		// happens in `cli/args.ts parseArgs`. The value is applied via `Settings.override("tools.approvalMode", …)`
+		// in `main.ts` after the `Settings` instance is constructed, so every `settings.get("tools.approvalMode")`
+		// site (wrapper, `/settings` UI) observes the same value.
+		"approval-mode": Flags.string({
+			options: ["always-ask", "write", "yolo"],
+			description: "Override tools.approvalMode for this session (always-ask|write|yolo)",
 		}),
 	};
 

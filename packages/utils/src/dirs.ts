@@ -343,9 +343,25 @@ export function getGithubCacheDbPath(): string {
 	return dirs.rootSubdir(path.join("cache", "github-cache.db"), "cache");
 }
 
+/**
+ * Get the encrypted auth-broker snapshot cache path (~/.omp/cache/auth-broker-snapshot.enc).
+ * Honors the `OMP_AUTH_BROKER_SNAPSHOT_CACHE` env var when set so tests and
+ * operators can isolate or relocate the cache file.
+ */
+export function getAuthBrokerSnapshotCachePath(): string {
+	const override = process.env.OMP_AUTH_BROKER_SNAPSHOT_CACHE;
+	if (override) return override;
+	return dirs.rootSubdir(path.join("cache", "auth-broker-snapshot.enc"), "cache");
+}
+
 /** Get the local FastEmbed model cache directory (~/.omp/cache/fastembed). */
 export function getFastembedCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "fastembed"), "cache");
+}
+
+/** Get the on-demand fastembed runtime install root (~/.omp/cache/fastembed-runtime). */
+export function getFastembedRuntimeDir(): string {
+	return dirs.rootSubdir(path.join("cache", "fastembed-runtime"), "cache");
 }
 
 /** Get the natives directory (~/.omp/natives). */
@@ -385,6 +401,11 @@ export function getAutoresearchRunDir(encodedProject: string, runId: number): st
 /** Get the path to agent.db (SQLite database for settings and auth storage). */
 export function getAgentDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "agent.db", "data");
+}
+
+/** Get the last-seen-changelog-version marker file (~/.omp/agent/last-changelog-version). */
+export function getLastChangelogVersionPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "last-changelog-version", "state");
 }
 
 /** Get the path to history.db (SQLite database for session history). */

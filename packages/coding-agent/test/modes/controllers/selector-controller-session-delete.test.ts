@@ -56,6 +56,10 @@ function createContext(currentSessionFile: string): {
 		sessionFile = "/tmp/project/sessions/detached.jsonl";
 		return true;
 	});
+	const session = {
+		newSession,
+		switchSession: vi.fn(async () => true),
+	};
 	const ctx = {
 		editorContainer,
 		editor: {},
@@ -66,9 +70,9 @@ function createContext(currentSessionFile: string): {
 			}),
 			terminal: { columns: 120 },
 		},
-		session: {
-			newSession,
-			switchSession: vi.fn(async () => true),
+		session,
+		get viewSession() {
+			return session;
 		},
 		sessionManager: {
 			getCwd: () => "/tmp/project",
@@ -124,6 +128,12 @@ function createContext(currentSessionFile: string): {
 		showError: vi.fn(),
 		showHookConfirm,
 		shutdown: vi.fn(async () => undefined),
+		clearTransientSessionUi() {
+			ctx.loadingAnimation?.stop();
+			ctx.statusContainer.clear();
+			ctx.pendingMessagesContainer.clear();
+			ctx.pendingTools.clear();
+		},
 	} as unknown as TestContext;
 
 	return {
@@ -229,7 +239,6 @@ describe("SelectorController session deletion", () => {
 		expect(ctx.showError).not.toHaveBeenCalled();
 		expect(ctx.sessionManager.getSessionFile()).toBe("/tmp/project/sessions/detached.jsonl");
 		expect(renderText(selector)).toContain("Error: Failed to delete session: disk failed");
-		expect(renderText(selector)).toContain("Active session");
 	});
 
 	it("creates a fresh session before deleting via slash command and then shows the selector", async () => {

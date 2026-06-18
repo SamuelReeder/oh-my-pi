@@ -60,7 +60,21 @@ export function buildAnthropicCompat(spec: ModelSpec<"anthropic-messages">): Res
 		// loses the reasoning chain and can destabilize the next tool-call
 		// arguments (#2005). Known non-signing hosts (Z.AI, DeepSeek) are also
 		// preserved for compatibility.
-		replayUnsignedThinking: isZai || modelMatchesHost(spec, "deepseekFamily") || (spec.reasoning && !official),
+		//
+		// The canonical `anthropic` provider is excluded from the `!official`
+		// catch-all even when its baseUrl is overridden: a user pointing
+		// `provider: anthropic` at a corporate gateway (e.g. AMD's
+		// `llm-api.amd.com/Anthropic`) is still fronting the real Anthropic API,
+		// which rejects unsigned thinking. `transform-messages` already treats
+		// `provider === "anthropic"` as official-involved and strips foreign
+		// signatures on a mid-conversation model switch; if we then replayed the
+		// now-unsigned blocks natively the encoder would emit `signature: ""` and
+		// the gateway would 400. Keeping this false makes the encoder text-demote
+		// instead, matching the signature-stripping policy (#2257-followup).
+		replayUnsignedThinking:
+			isZai ||
+			modelMatchesHost(spec, "deepseekFamily") ||
+			(spec.reasoning && !official && spec.provider !== "anthropic"),
 	};
 	applyCompatOverrides(compat, spec.compat);
 	return compat;

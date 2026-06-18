@@ -7,10 +7,14 @@ import { getModelDbPath } from "@oh-my-pi/pi-utils";
 import type { Api, Model, ModelSpec } from "./types";
 
 // Rows persist ModelSpec JSON (sparse `compat`, never the resolved record);
-// the model manager rebuilds via `buildModel` on load. v5 invalidates rows
-// predating effort-tier variant collapsing (raw `-low`/`-high`/`-thinking`
-// member ids); v4 dropped the pre-efforts ThinkingConfig shape.
-const CACHE_SCHEMA_VERSION = 5;
+// the model manager rebuilds via `buildModel` on load. v6 invalidates rows
+// whose persisted `compat` was a fully-resolved record (older writers/migrated
+// rows): `buildModel` feeds that object back through `applyCompatOverrides`, so
+// a stale resolved `replayUnsignedThinking` would shadow the corrected
+// anthropic-gateway resolution. v5 invalidated rows predating effort-tier
+// variant collapsing (raw `-low`/`-high`/`-thinking` member ids); v4 dropped
+// the pre-efforts ThinkingConfig shape.
+const CACHE_SCHEMA_VERSION = 6;
 
 interface CacheRow {
 	provider_id: string;

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed mid-conversation model switches 400ing with "Invalid `signature` in `thinking` block" when the canonical `anthropic` provider is pointed at a corporate gateway that fronts the real Anthropic API (e.g. AMD's `llm-api.amd.com/Anthropic`). `buildAnthropicCompat` no longer auto-enables `replayUnsignedThinking` for `provider === "anthropic"` via the `reasoning && !official` catch-all, so the encoder text-demotes unsigned thinking instead of emitting an empty `signature` that the gateway rejects. This matches `transform-messages`, which already treats the canonical provider as official-involved and strips foreign signatures on the switch. Genuinely Anthropic-compatible reasoning endpoints declared under their own provider id (and Z.AI/DeepSeek hosts) still replay unsigned thinking natively.
+- Bumped the model cache schema to v6 so rows persisting a fully-resolved `compat` (older writers / migrated rows) are invalidated and rebuilt via `buildModel`; otherwise a stale resolved `replayUnsignedThinking: true` would be re-applied as an override and shadow the anthropic-gateway fix above.
+
 ## [15.11.8] - 2026-06-12
 
 ### Fixed

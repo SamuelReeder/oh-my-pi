@@ -4,8 +4,12 @@ import {
 	type RequestBody,
 	transformRequestBody,
 } from "@oh-my-pi/pi-ai/providers/openai-codex/request-transformer";
-import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import {
+	convertCodexResponsesMessages,
+	streamOpenAICodexResponses,
+} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type { Context, FetchImpl } from "@oh-my-pi/pi-ai/types";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { createCodexModel } from "./helpers";
 
 function createCodexTestToken(accountId = "acc_test"): string {
@@ -79,21 +83,21 @@ function createCodexFetchMock(sse: string, onRequest: (captured: CapturedCodexRe
 }
 
 describe("openai-codex reasoning.context", () => {
-	it("forwards an explicit reasoning.context and omits it by default", async () => {
-		const model = createCodexModel("gpt-5.1-codex");
+	it("defaults to all_turns on gpt-5.4+ models and forwards explicit overrides", async () => {
+		const model = createCodexModel("gpt-5.4");
+
+		const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+		expect(defaulted.reasoning?.context).toBe("all_turns");
 
 		const explicit = await transformRequestBody({ model: model.id }, model, {
 			reasoningEffort: "medium",
 			reasoningContext: "current_turn",
 		});
 		expect(explicit.reasoning?.context).toBe("current_turn");
-
-		const omitted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
-		expect(omitted.reasoning?.context).toBeUndefined();
 	});
 
-	it("defaults reasoning.context to all_turns under Responses Lite unless overridden", async () => {
-		const model = createCodexModel("gpt-5.1-codex");
+	it("keeps the all_turns default for the lite transport on supported models", async () => {
+		const model = createCodexModel("gpt-5.5");
 
 		const lite = await transformRequestBody({ model: model.id }, model, {
 			reasoningEffort: "medium",
@@ -108,10 +112,43 @@ describe("openai-codex reasoning.context", () => {
 		});
 		expect(overridden.reasoning?.context).toBe("auto");
 	});
+
+	// gpt-5.1-codex / gpt-5.3-codex / gpt-5.3-codex-spark reject `all_turns`
+	// ("Unsupported value: 'all_turns' is not supported with this model").
+	it.each([
+		"gpt-5.1-codex",
+		"gpt-5.3-codex",
+		"gpt-5.3-codex-spark",
+	])("omits the all_turns default for pre-5.4 model %s", async modelId => {
+		const model = createCodexModel(modelId);
+
+		const defaulted = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+		expect(defaulted.reasoning).toBeDefined();
+		expect(defaulted.reasoning?.context).toBeUndefined();
+		expect("context" in (defaulted.reasoning ?? {})).toBe(false);
+
+		// A supported override (current_turn/auto) is still honored.
+		const overridden = await transformRequestBody({ model: model.id }, model, {
+			reasoningEffort: "medium",
+			reasoningContext: "current_turn",
+		});
+		expect(overridden.reasoning?.context).toBe("current_turn");
+	});
+
+	it("suppresses an explicit all_turns override on a pre-5.4 model", async () => {
+		const model = createCodexModel("gpt-5.3-codex-spark");
+
+		const forced = await transformRequestBody({ model: model.id }, model, {
+			reasoningEffort: "medium",
+			reasoningContext: "all_turns",
+		});
+		expect(forced.reasoning).toBeDefined();
+		expect(forced.reasoning?.context).toBeUndefined();
+	});
 });
 
 describe("openai-codex Responses Lite input shaping", () => {
-	it("strips image detail from message content and tool outputs only under lite", async () => {
+	it("keeps full Responses image details when a requested lite body contains images", async () => {
 		const model = createCodexModel("gpt-5.1-codex");
 		const makeInput = (): InputItem[] => [
 			{
@@ -133,12 +170,44 @@ describe("openai-codex Responses Lite input shaping", () => {
 		const lite = await transformRequestBody({ model: model.id, input: makeInput() }, model, { responsesLite: true });
 		const liteMessage = lite.input?.[0]?.content as Array<Record<string, unknown>>;
 		const liteOutput = lite.input?.[2]?.output as Array<Record<string, unknown>>;
-		expect(liteMessage[1]).toEqual({ type: "input_image", image_url: "data:image/png;base64,AAAA" });
-		expect(liteOutput[0]).toEqual({ type: "input_image", image_url: "data:image/png;base64,BBBB" });
+		expect(liteMessage[1]).toEqual({ type: "input_image", detail: "auto", image_url: "data:image/png;base64,AAAA" });
+		expect(liteOutput[0]).toEqual({ type: "input_image", detail: "high", image_url: "data:image/png;base64,BBBB" });
 
 		const plain = await transformRequestBody({ model: model.id, input: makeInput() }, model, {});
 		const plainMessage = plain.input?.[0]?.content as Array<Record<string, unknown>>;
 		expect(plainMessage[1]?.detail).toBe("auto");
+	});
+
+	it("clamps original image detail when Codex compat disables it", () => {
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-codex-responses",
+			provider: "cc-switch",
+			baseUrl: "http://127.0.0.1:8080/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 200_000,
+			maxTokens: 100_000,
+			compat: { supportsImageDetailOriginal: false },
+		});
+		const messages = convertCodexResponsesMessages(model, {
+			messages: [
+				{
+					role: "user",
+					timestamp: Date.now(),
+					content: [
+						{ type: "text", text: "look" },
+						{ type: "image", mimeType: "image/png", data: "AAAA", detail: "original" },
+					],
+				},
+			],
+		});
+		expect(messages[0]).toMatchObject({
+			role: "user",
+			content: [{ type: "input_text" }, { type: "input_image", detail: "auto" }],
+		});
 	});
 
 	it("forces parallel_tool_calls off under lite when tools are present", async () => {
@@ -177,6 +246,57 @@ describe("openai-codex Responses Lite and client metadata wire format", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBe("true");
 		expect(captured?.body.client_metadata).toEqual(clientMetadata);
+	});
+	it("falls back to full Responses when a lite request contains images", async () => {
+		const model = buildModel({
+			id: "gpt-5.5",
+			name: "GPT-5.5",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		});
+		let captured: CapturedCodexRequest | undefined;
+		const fetchMock = createCodexFetchMock(createCodexSse(COMPLETED_CODEX_EVENTS), request => {
+			captured = request;
+		});
+
+		const result = await streamOpenAICodexResponses(
+			model,
+			{
+				messages: [
+					{
+						role: "user",
+						timestamp: Date.now(),
+						content: [
+							{ type: "text", text: "read this image" },
+							{ type: "image", mimeType: "image/png", data: "AAAA" },
+						],
+					},
+				],
+			},
+			{
+				apiKey: createCodexTestToken(),
+				fetch: fetchMock,
+				responsesLite: true,
+			},
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(captured?.headers.get("x-openai-internal-codex-responses-lite")).toBeNull();
+		expect(captured?.body.input).toEqual([
+			{
+				role: "user",
+				content: [
+					{ type: "input_text", text: "read this image" },
+					{ type: "input_image", detail: "auto", image_url: "data:image/png;base64,AAAA" },
+				],
+			},
+		]);
 	});
 
 	it("omits the lite header and client_metadata when not requested", async () => {

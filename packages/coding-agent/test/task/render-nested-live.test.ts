@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentProgress, SingleResult, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task";
-import { taskToolRenderer } from "@oh-my-pi/pi-coding-agent/task/render";
+import { taskToolRenderer } from "@oh-my-pi/pi-coding-agent/task/renderer";
 import { formatDuration, formatNumber } from "@oh-my-pi/pi-utils";
 
 describe("task renderer: nested live rendering", () => {
@@ -158,6 +158,29 @@ describe("task renderer: nested live rendering", () => {
 		expect(text).toContain("Delta child running");
 		expect(text).toContain("Parent>GammaSub");
 		expect(text).toContain("Parent>DeltaSub");
+	});
+
+	it("does not recurse forever when a nested task snapshot points at itself", async () => {
+		const inflight: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 0,
+			progress: [],
+		};
+		const child = makeRunningSubProgress("Parent.CycleSub", "Cycle child running");
+		child.inflightTaskDetails = inflight;
+		inflight.progress = [child];
+		const parent = makeRunningProgress({
+			id: "Parent",
+			currentTool: "task",
+			currentToolStartMs: Date.now(),
+			inflightTaskDetails: inflight,
+		});
+
+		const text = await render(parent);
+
+		expect(text).toContain("Cycle child running");
+		expect(text).toContain("nested task progress already shown");
 	});
 
 	it("combines completed and in-flight nested snapshots in one tree", async () => {

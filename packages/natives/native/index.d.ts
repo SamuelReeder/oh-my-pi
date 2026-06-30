@@ -116,7 +116,33 @@ export declare class Shell {
    * Returns `Ok(())` even when no commands are running.
    */
   abort(): Promise<void>
+  /**
+   * Count live background jobs (`&`/`nohup` children still running) on this
+   * session. Completed jobs are reaped first. The host uses this to retain a
+   * per-call shell whose background processes are still running instead of
+   * dropping it (which would SIGKILL them via kill-on-drop).
+   */
+  liveBackgroundJobCount(): Promise<number>
 }
+
+/**
+ * Install the bounded Tokio runtime napi-rs adopts for async exports.
+ *
+ * The JS loader calls this exactly once, synchronously, right *after* `dlopen`
+ * returns and *before* any async native runs — never from `#[module_init]`.
+ * Building a multi-thread runtime eagerly spawns worker threads, and doing
+ * that during module init (while the dynamic-loader lock is held) deadlocks on
+ * some hosts: a fresh worker blocks acquiring the loader lock that the init
+ * thread still owns. napi-rs only materializes its runtime on the first async
+ * call (`RT` is a `LazyLock`) and `create_custom_tokio_runtime` merely records
+ * the runtime in a `OnceLock`, so installing it post-load is still honored.
+ * Without it napi builds its own default (one worker per CPU, spawned eagerly)
+ * which aborts the process (`os error 1455`) on a memory-constrained Windows
+ * host before any JS error can surface; [`create_windows_napi_tokio_runtime`]
+ * pre-flights the spawn instead. If no runtime can be built we leave napi-rs
+ * to its default. Idempotent.
+ */
+export declare function __ompInstallTokioRuntime(): void
 
 /**
  * Version sentinel — exists solely so the JS loader can prove at load time
@@ -136,7 +162,7 @@ export declare class Shell {
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV15_12_3(): void
+export declare function __piNativesV16_2_9(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -735,8 +761,6 @@ export interface GrepOptions {
   hidden?: boolean
   /** Respect .gitignore files (default: true). */
   gitignore?: boolean
-  /** Enable shared filesystem scan cache (default: false). */
-  cache?: boolean
   /** Maximum number of matches to return. */
   maxCount?: number
   /** Skip first N matches. */
@@ -1285,24 +1309,26 @@ export interface PtyStartOptions {
 export declare function readImageFromClipboard(): Promise<ClipboardImage | undefined | null>
 
 /**
- * Render one snapcompact frame: print pre-normalized text onto a
- * `size`-wide bitmap and encode it as PNG.
+ * Render one snapcompact frame on a libuv worker: print pre-normalized text
+ * onto a `size`-wide bitmap and encode it as PNG.
  *
  * The bitmap height hugs the rows the text actually occupies
  * (`usedRows * lineRepeat * cellHeight`), so a partially filled frame never
  * pays for blank padding rows. The glyph grid holds `floor(size/cellWidth) *
- * floor(size/cellHeight/lineRepeat)` characters; input beyond that is ignored
- * (the caller chunks text to capacity). Native-cell shapes encode as 4-bit
- * indexed PNG; stretched shapes (target cell != font cell) encode as RGB.
- * `stretch: false` pins the indexed path, printing natural-size glyphs on the
- * requested cell box; `columns: 2` flows pre-wrapped newline-separated lines
- * down two newspaper columns. `U+000E`/`U+000F` in `text` toggle dim-gray ink
- * spans without occupying a cell.
- * Returns the PNG encoded as base64, created as a one-byte (Latin-1) JS
- * string straight from native code — no `Uint8Array` hop or JS-side
- * re-encode.
+ * floor(size/cellHeight/lineRepeat)` characters; input beyond that is ignored.
+ * Native-cell bitmap-font shapes encode as indexed PNG; stretched bitmap-font
+ * shapes (target cell != font cell) encode as RGB. TrueType shapes encode RGB
+ * directly from grayscale coverage.
+ * `stretch: false` pins bitmap fonts to the indexed path, printing
+ * natural-size glyphs on the requested cell box; `columns: 2` flows
+ * pre-wrapped newline-separated lines down two newspaper columns.
+ * `U+000E`/`U+000F` in `text` toggle dim-gray ink spans without occupying a
+ * cell.
+ * Returns a promise for the PNG encoded as base64, created as a one-byte
+ * (Latin-1) JS string straight from native code — no `Uint8Array` hop or
+ * JS-side re-encode.
  */
-export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): string
+export declare function renderSnapcompactPng(text: string, options: SnapcompactRenderOptions): Promise<string>
 
 /**
  * Search content for a pattern (one-shot, compiles pattern each time).
@@ -1352,6 +1378,8 @@ export interface SearchResult {
   /** Error message, if any. */
   error?: string
 }
+
+export declare function setHangulCompatJamoWidthOverride(value: number): void
 
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
@@ -1442,8 +1470,8 @@ export interface SnapcompactRenderOptions {
    */
   size: number
   /**
-   * Bundled font: `"5x8"`, `"6x12"`, `"8x13"` (X.org BDF) or `"8x8"`
-   * (unscii-8). Default `"5x8"`.
+   * Bundled font: `"5x8"`, `"6x12"`, `"8x13"` (X.org BDF), `"8x8"`
+   * (unscii-8), or `"silver"` (embedded TrueType). Default `"5x8"`.
    */
   font?: string
   /**
@@ -1477,6 +1505,15 @@ export interface SnapcompactRenderOptions {
    */
   columns?: number
 }
+
+/**
+ * Return the subset of `chars` that the named snapcompact font can render.
+ *
+ * The TypeScript normalizer uses this to keep Unicode text intact only when
+ * the selected native font has a glyph for it; renderer control codes are
+ * considered renderable because they are interpreted outside font lookup.
+ */
+export declare function snapcompactSupportedChars(font: string, chars: string): string
 
 export declare function summarizeCode(options: SummaryOptions): SummaryResult
 

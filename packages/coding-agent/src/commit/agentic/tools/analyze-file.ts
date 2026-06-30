@@ -1,5 +1,5 @@
 import { prompt } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { type } from "arktype";
 import analyzeFilePrompt from "../../../commit/agentic/prompts/analyze-file.md" with { type: "text" };
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import type { NumstatEntry } from "../../../commit/types";
@@ -12,9 +12,9 @@ import type { TaskParams } from "../../../task/types";
 import type { ToolSession } from "../../../tools";
 import { getFilePriority } from "./git-file-diff";
 
-const analyzeFileSchema = z.object({
-	files: z.array(z.string().describe("file path")).min(1),
-	goal: z.string().describe("analysis focus").optional(),
+const analyzeFileSchema = type({
+	files: type("string").describe("file path").array().atLeastLength(1),
+	"goal?": type("string").describe("analysis focus"),
 });
 
 const analyzeFileOutputSchema = {
@@ -38,6 +38,9 @@ function buildToolSession(
 	return {
 		cwd: options.cwd,
 		hasUI: false,
+		// Programmatic fan-out: results feed the commit agent's evidence, not a
+		// model choosing further spawns, so the specialization nudge is noise here.
+		suppressSpawnAdvisory: true,
 		getSessionFile: () => ctx.sessionManager.getSessionFile() ?? null,
 		getSessionSpawns: () => options.spawns,
 		settings: options.settings,
@@ -60,7 +63,7 @@ export function createAnalyzeFileTool(options: {
 	return {
 		name: "analyze_files",
 		label: "Analyze Files",
-		description: "Spawn quick_task agents to analyze files.",
+		description: "Spawn sonic agents to analyze files.",
 		parameters: analyzeFileSchema,
 		async execute(toolCallId, params, _onUpdate, ctx, signal) {
 			const toolSession = buildToolSession(ctx, options);
@@ -80,7 +83,7 @@ export function createAnalyzeFileTool(options: {
 						related_files: relatedFiles,
 					});
 					const taskParams: TaskParams = {
-						agent: "quick_task",
+						agent: "sonic",
 						id: `AnalyzeFile${index + 1}`,
 						description: `Analyze ${file}`,
 						assignment,

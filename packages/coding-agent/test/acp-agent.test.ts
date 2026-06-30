@@ -20,6 +20,7 @@ import {
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
 	AcpAgent,
@@ -29,8 +30,27 @@ import type { PlanModeState } from "@oh-my-pi/pi-coding-agent/plan-mode/state";
 import type { AgentSession, AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { DEFAULT_STT_MODEL_KEY, STT_MODEL_OPTIONS } from "@oh-my-pi/pi-coding-agent/stt/models";
+import {
+	DEFAULT_TTS_LOCAL_MODEL_KEY,
+	DEFAULT_TTS_VOICE,
+	TTS_LOCAL_MODELS,
+	TTS_LOCAL_VOICE_OPTIONS,
+} from "@oh-my-pi/pi-coding-agent/tts/models";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
-import { expectAcpStructure } from "./helpers/acp-schema";
+import type { z } from "zod/v4";
+
+/**
+ * Validate an ACP wire payload against the external `@agentclientprotocol/sdk`
+ * Zod schemas. Those schemas come from the ACP protocol SDK (external boundary)
+ * and cannot be expressed as ArkType, so they stay on Zod and are validated via
+ * `.safeParse` directly rather than through the ArkType-only `expectAcpStructure`
+ * helper in `./helpers/acp-schema`.
+ */
+function expectAcpStructure(schema: z.ZodType, value: unknown): void {
+	const result = schema.safeParse(value);
+	expect(result.success, result.success ? undefined : JSON.stringify(result.error.issues, null, 2)).toBe(true);
+}
 
 const TEST_MODELS: Model[] = [
 	buildModel({
@@ -488,13 +508,16 @@ describe("ACP agent", () => {
 		expectAcpStructure(zNewSessionResponse, first);
 		expectAcpStructure(zNewSessionResponse, second);
 
-		expect(first.models?.availableModels.map(model => model.modelId)).toEqual(
+		const modelOption = first.configOptions?.find(opt => opt.id === "model");
+		expect(modelOption?.type).toBe("select");
+		expect((modelOption as any).options?.map((opt: any) => opt.value)).toEqual(
 			TEST_MODELS.map(model => `${model.provider}/${model.id}`),
 		);
 
-		await harness.agent.unstable_setSessionModel({
+		await harness.agent.setSessionConfigOption({
 			sessionId: first.sessionId,
-			modelId: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
 		});
 		await harness.agent.setSessionConfigOption({
 			sessionId: first.sessionId,
@@ -630,11 +653,14 @@ describe("ACP agent", () => {
 		const session = harness.findSession(created.sessionId)!;
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
 
-		const artifactsDir = session.sessionManager.getArtifactsDir();
-		expect(artifactsDir).not.toBeNull();
-		// The agent writes to its chosen `local://<slug>-plan.md` and resolves with
-		// the matching slug — the file is never renamed.
-		const planPath = path.join(artifactsDir!, "local", "words-counter-plan.md");
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		// On Windows, long artifact roots are shortened by the local:// resolver to
+		// avoid MAX_PATH. Write through the same resolver the ACP handler reads from.
+		const planPath = resolveLocalUrlToPath("local://words-counter-plan.md", localOptions);
 		await Bun.write(planPath, "# Words Counter\n\nFile contents.");
 
 		const updatesBefore = harness.updates.length;
@@ -700,8 +726,12 @@ describe("ACP agent", () => {
 		const session = harness.findSession(created.sessionId)!;
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
 
-		const artifactsDir = session.sessionManager.getArtifactsDir();
-		const planPath = path.join(artifactsDir!, "local", "PLAN.md");
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		const planPath = resolveLocalUrlToPath("local://PLAN.md", localOptions);
 		await Bun.write(planPath, "# Words Counter\n\nFile contents.");
 
 		const updatesBefore = harness.updates.length;
@@ -715,7 +745,7 @@ describe("ACP agent", () => {
 		expect(result.content[0]?.text).toMatch(/refinement requested/i);
 		// Plan file stays put; no rename, no write-access grant.
 		expect(await Bun.file(planPath).exists()).toBe(true);
-		expect(await Bun.file(path.join(artifactsDir!, "local", "words-counter.md")).exists()).toBe(false);
+		expect(await Bun.file(resolveLocalUrlToPath("local://words-counter.md", localOptions)).exists()).toBe(false);
 		// Plan mode + standing handler stay active so the agent can iterate.
 		expect(session.planModeState?.enabled).toBe(true);
 		expect(typeof session.standingResolveHandler).toBe("function");
@@ -861,7 +891,50 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("accepts only ACP underscore-prefixed extension methods", async () => {
+	it("lists static speech models for ACP mobile voice settings", async () => {
+		const harness = await createHarness();
+		const voices = TTS_LOCAL_VOICE_OPTIONS.map(({ value, label }) => ({ value, label }));
+
+		const result = await harness.agent.extMethod("speech.models.list", {});
+
+		expect(result).toEqual({
+			settings: {
+				speechToTextModel: "stt.modelName",
+				textToSpeechModel: "tts.localModel",
+				textToSpeechVoice: "tts.localVoice",
+				speechVoice: "speech.voice",
+			},
+			defaults: {
+				speechToTextModel: DEFAULT_STT_MODEL_KEY,
+				textToSpeechModel: DEFAULT_TTS_LOCAL_MODEL_KEY,
+				voice: DEFAULT_TTS_VOICE,
+			},
+			speechToText: {
+				setting: "stt.modelName",
+				defaultValue: DEFAULT_STT_MODEL_KEY,
+				models: STT_MODEL_OPTIONS.map(({ value, label, description }) => ({ value, label, description })),
+			},
+			textToSpeech: {
+				modelSetting: "tts.localModel",
+				voiceSetting: "tts.localVoice",
+				speechVoiceSetting: "speech.voice",
+				defaultModel: DEFAULT_TTS_LOCAL_MODEL_KEY,
+				defaultVoice: DEFAULT_TTS_VOICE,
+				models: TTS_LOCAL_MODELS.map(({ key, label, description, voices: modelVoices }) => ({
+					value: key,
+					label,
+					description,
+					voices: modelVoices.map(({ id, label: voiceLabel }) => ({ value: id, label: voiceLabel })),
+				})),
+				voices,
+			},
+		});
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("accepts OMP extension methods and rejects unknown unprefixed methods", async () => {
 		const harness = await createHarness();
 
 		const result = await harness.agent.extMethod("_omp/sessions/listAll", { limit: 2 });
@@ -914,16 +987,14 @@ describe("ACP agent", () => {
 		const live = await harness.agent.newSession({ cwd: harness.cwdB, mcpServers: [] });
 		const response = await harness.agent.prompt({
 			sessionId: live.sessionId,
-			messageId: "05b17a6f-b310-4be7-b767-6b4f3a84eb63",
 			prompt: [{ type: "text", text: "ping" }],
-		} as PromptRequest);
+		});
 		expectAcpStructure(zPromptResponse, response);
 		expectAcpNotifications(harness.updates);
 
 		const liveChunks = harness.updates.filter(
 			update => update.sessionId === live.sessionId && update.update.sessionUpdate === "agent_message_chunk",
 		);
-		expect(response.userMessageId).toBe("05b17a6f-b310-4be7-b767-6b4f3a84eb63");
 		expect(response.usage).toEqual({
 			inputTokens: 10,
 			outputTokens: 5,
@@ -1508,9 +1579,8 @@ describe("ACP agent", () => {
 
 		const firstPrompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000029",
 			prompt: [{ type: "text", text: "wait for cleanup" }],
-		} as PromptRequest);
+		});
 		await idleBlocked;
 
 		try {
@@ -1519,8 +1589,7 @@ describe("ACP agent", () => {
 			expect(session.waitForIdleCalls).toBe(1);
 
 			unblockIdle();
-			const response = await firstPrompt;
-			expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000029");
+			await firstPrompt;
 		} finally {
 			unblockIdle();
 			harness.abortController.abort();
@@ -1548,9 +1617,8 @@ describe("ACP agent", () => {
 
 		const prompt = harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000047",
 			prompt: [{ type: "text", text: "wait for async delivery" }],
-		} as PromptRequest);
+		});
 		await deliveryBlocked.promise;
 
 		try {
@@ -1559,8 +1627,7 @@ describe("ACP agent", () => {
 			expect(session.waitForIdleCalls).toBe(1);
 
 			releaseDelivery();
-			const response = await prompt;
-			expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000047");
+			await prompt;
 			expect(session.waitForIdleCalls).toBe(2);
 			expect(drainCalls).toBe(2);
 		} finally {
@@ -1903,16 +1970,14 @@ describe("ACP agent", () => {
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 
-		const response = await harness.agent.prompt({
+		await harness.agent.prompt({
 			sessionId: created.sessionId,
-			messageId: "00000000-0000-4000-8000-000000000002",
 			prompt: [{ type: "text", text: "/fast status" }],
-		} as PromptRequest);
+		});
 
 		const chunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
 		);
-		expect(response.userMessageId).toBe("00000000-0000-4000-8000-000000000002");
 		expect(session.promptCalls).toEqual([]);
 		expect(
 			chunks.some(

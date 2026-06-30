@@ -5,7 +5,8 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { Api, ApiKey, AssistantMessage, Context, Model, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
+import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { prompt } from "@oh-my-pi/pi-utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage } from "../types";
@@ -87,6 +88,17 @@ export interface GenerateBranchSummaryOptions {
 	 * wrapped in an OTEL chat span tagged with `pi.gen_ai.oneshot.kind = "branch_summary"`.
 	 */
 	telemetry?: AgentTelemetry;
+	/**
+	 * Optional completion transport override (same contract as
+	 * {@link SummaryOptions.completeImpl}). Lets the host route the branch
+	 * summary HTTP request through its provider-concurrency limiter instead
+	 * of the default `completeSimple` transport.
+	 */
+	completeImpl?: <TApi extends Api>(
+		model: Model<TApi>,
+		ctx: Context,
+		options: SimpleStreamOptions,
+	) => Promise<AssistantMessage>;
 }
 
 // ============================================================================
@@ -290,7 +302,7 @@ export async function generateBranchSummary(
 	// Transform to LLM-compatible messages, then serialize to text
 	// Serialization prevents the model from treating it as a conversation to continue
 	const llmMessages = (options.convertToLlm ?? defaultConvertToLlm)(messages);
-	const conversationText = serializeConversation(llmMessages);
+	const conversationText = serializeConversation(llmMessages, preferredDialect(model.id));
 
 	// Build prompt
 	const instructions = customInstructions || BRANCH_SUMMARY_PROMPT;
@@ -309,7 +321,7 @@ export async function generateBranchSummary(
 		model,
 		{ systemPrompt: [SUMMARIZATION_SYSTEM_PROMPT], messages: summarizationMessages },
 		{ apiKey, signal, maxTokens: 2048, metadata },
-		{ telemetry: options.telemetry, oneshotKind: "branch_summary" },
+		{ telemetry: options.telemetry, oneshotKind: "branch_summary", completeImpl: options.completeImpl },
 	);
 
 	// Check if aborted or errored

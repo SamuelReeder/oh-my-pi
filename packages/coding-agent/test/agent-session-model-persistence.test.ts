@@ -8,11 +8,9 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type CreateAgentSessionResult, createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import {
-	EPHEMERAL_MODEL_CHANGE_ROLE,
-	getRestorableSessionModels,
-	SessionManager,
-} from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession model persistence", () => {
@@ -188,6 +186,29 @@ describe("AgentSession model persistence", () => {
 		await created.session.setModel(nextModel, "default", { persist: true });
 
 		expect(created.session.model?.id).toBe(nextModel.id);
+		expect(created.settings.getModelRole("default")).toBe(modelValue(nextModel));
+	});
+
+	it("persists the default role without switching the active model when over context", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const nextModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+
+		const created = await createSession({
+			initialModel: defaultModel,
+			modelRoles: { default: modelValue(defaultModel) },
+		});
+
+		const targetWindow = nextModel.contextWindow ?? 0;
+		expect(targetWindow).toBeGreaterThan(0);
+		const overflowTokens = targetWindow + 1;
+
+		const result = await created.session.setModel(nextModel, "default", {
+			persist: true,
+			currentContextTokens: overflowTokens,
+		});
+
+		expect(result).toEqual({ switched: false });
+		expect(created.session.model?.id).toBe(defaultModel.id);
 		expect(created.settings.getModelRole("default")).toBe(modelValue(nextModel));
 	});
 

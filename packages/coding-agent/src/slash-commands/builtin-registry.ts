@@ -6,6 +6,7 @@ import { type AutocompleteItem, Spacer } from "@oh-my-pi/pi-tui";
 import { APP_NAME, getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { COLLAB_GUEST_ALLOWED_COMMANDS, CollabGuestLink } from "../collab/guest";
 import { CollabHost } from "../collab/host";
+import { expandRoleAlias, getModelMatchPreferences, resolveCliModel } from "../config/model-resolver";
 import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import type { SettingPath, SettingValue } from "../config/settings";
 import { settings } from "../config/settings";
@@ -24,16 +25,24 @@ import {
 	MarketplaceManager,
 } from "../extensibility/plugins/marketplace";
 import { resolveMemoryBackend } from "../memory-backend";
+import { runPauseScreen } from "../modes/components/pause-screen";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import { theme } from "../modes/theme/theme";
 import type { InteractiveModeContext } from "../modes/types";
+import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-targets";
 import type { AgentSession, FreshSessionResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { resolveResumableSession } from "../session/session-listing";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
 import { urlHyperlinkAlways } from "../tui";
-import { getChangelogPath, parseChangelog } from "../utils/changelog";
+import {
+	getChangelogPath,
+	parseChangelog,
+	RECENT_CHANGELOG_ENTRY_LIMIT,
+	renderChangelogEntries,
+} from "../utils/changelog";
+import { copyToClipboard } from "../utils/clipboard";
 import { CollabQrCodeComponent } from "./helpers/collab-qrcode";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
@@ -69,7 +78,6 @@ export interface TuiBuiltinSlashCommand extends BuiltinSlashCommand {
 
 function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.statusLine.invalidate();
-	ctx.updateEditorTopBorder();
 	ctx.ui.requestRender();
 }
 
@@ -250,6 +258,22 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "vibe",
+		description: "Toggle vibe mode (direct persistent fast/good worker sessions; read-only toolset)",
+		inlineHint: "[prompt]",
+		allowArgs: true,
+		getTuiAutocompleteDescription: runtime => {
+			if (runtime.ctx.vibeModeEnabled) return "Vibe: on";
+			if (runtime.ctx.planModeEnabled) return "Vibe: blocked by plan mode";
+			if (runtime.ctx.goalModeEnabled) return "Vibe: blocked by goal mode";
+			return "Vibe: off";
+		},
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleVibeModeCommand(command.args || undefined);
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "goal",
 		description: "Toggle goal mode (persistent autonomous objective for this session)",
 		subcommands: [
@@ -301,6 +325,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			// Surface any inline prompt so the dispatcher returns it and the normal
 			// submit flow runs the first loop iteration (recording it as the loop prompt).
 			if (prompt) return { prompt };
+		},
+	},
+	{
+		name: "queue",
+		description: "Queue a message for after the agent yields",
+		inlineHint: "<message>",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleQueueCommand(command.args);
 		},
 	},
 	{
@@ -379,8 +412,8 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			if (arg === "on") {
-				runtime.session.setFastMode(true);
-				await runtime.output("Fast mode enabled.");
+				const supported = runtime.session.setFastMode(true);
+				await runtime.output(supported ? "Fast mode enabled." : "Fast mode is unavailable for the current model.");
 				return commandConsumed();
 			}
 			if (arg === "off") {
@@ -404,9 +437,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				return;
 			}
 			if (arg === "on") {
-				runtime.ctx.session.setFastMode(true);
+				const supported = runtime.ctx.session.setFastMode(true);
 				refreshStatusLine(runtime.ctx);
-				runtime.ctx.showStatus("Fast mode enabled.");
+				runtime.ctx.showStatus(
+					supported ? "Fast mode enabled." : "Fast mode is unavailable for the current model.",
+				);
 				runtime.ctx.editor.setText("");
 				return;
 			}
@@ -424,6 +459,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			runtime.ctx.showStatus("Usage: /fast [on|off|status]");
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "downshift",
+		description: "Switch to a fast/cheap model at the next action (works even without --downshift)",
+		acpDescription: "Downshift at the next action",
+		handle: async (_command, runtime) => {
+			const rolePattern = expandRoleAlias("pi/smol", runtime.settings);
+			const resolved = resolveCliModel({
+				cliModel: rolePattern,
+				modelRegistry: runtime.session.modelRegistry,
+				preferences: getModelMatchPreferences(runtime.settings),
+			});
+			if (resolved.error || !resolved.model) {
+				return usage(resolved.error ?? `Model "${rolePattern}" not found`, runtime);
+			}
+			if (!runtime.session.modelRegistry.hasConfiguredAuth(resolved.model)) {
+				return usage(`No API key for ${resolved.model.provider}/${resolved.model.id}`, runtime);
+			}
+			runtime.session.armDownshift(resolved.model, resolved.thinkingLevel);
+			await runtime.output(
+				`Downshift on: switching to ${resolved.model.provider}/${resolved.model.id} at the next edit/write (todo-gated).`,
+			);
+			return commandConsumed();
 		},
 	},
 	{
@@ -841,8 +900,39 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "copy",
 		description: "Pick text or code from the conversation to copy",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.showCopySelector();
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (!arg) {
+				runtime.ctx.showCopySelector();
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (arg === "code") {
+				const block = extractLastCodeBlock(runtime.ctx.session.messages);
+				if (!block) {
+					runtime.ctx.showStatus("No code block to copy.");
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				await copyToClipboard(block.code);
+				runtime.ctx.showStatus("Copied code block to clipboard");
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			if (arg === "cmd" || arg === "command") {
+				const lastCommand = extractLastCommand(runtime.ctx.session.messages);
+				if (!lastCommand) {
+					runtime.ctx.showStatus("No command to copy.");
+					runtime.ctx.editor.setText("");
+					return;
+				}
+				await copyToClipboard(lastCommand.code);
+				runtime.ctx.showStatus(`Copied ${lastCommand.kind === "bash" ? "bash command" : "eval code"} to clipboard`);
+				runtime.ctx.editor.setText("");
+				return;
+			}
+			runtime.ctx.showStatus("Usage: /copy [code|cmd]");
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -1048,17 +1138,12 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			const changelogPath = getChangelogPath();
 			const allEntries = await parseChangelog(changelogPath);
 			const showFull = command.args.trim().toLowerCase() === "full";
-			const entriesToShow = showFull ? allEntries : allEntries.slice(0, 3);
+			const entriesToShow = showFull ? allEntries : allEntries.slice(0, RECENT_CHANGELOG_ENTRY_LIMIT);
 			if (entriesToShow.length === 0) {
 				await runtime.output("No changelog entries found.");
 				return commandConsumed();
 			}
-			await runtime.output(
-				[...entriesToShow]
-					.reverse()
-					.map(entry => entry.content)
-					.join("\n\n"),
-			);
+			await runtime.output(renderChangelogEntries(entriesToShow).markdown);
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
@@ -2220,6 +2305,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "pause",
+		description: "Freeze all agents (main, subagents, advisor) until resumed",
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runPauseScreen(runtime.ctx);
+		},
+	},
+	{
 		name: "quit",
 		description: "Quit the application",
 		handleTui: shutdownHandlerTui,
@@ -2405,6 +2498,7 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BU
 	command => ({
 		name: command.name,
 		aliases: command.aliases,
+		allowArgs: command.allowArgs === true,
 		description: command.description,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,

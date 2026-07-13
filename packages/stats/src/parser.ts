@@ -6,14 +6,19 @@ import {
 	getPriorityPremiumRequests,
 	resolveModelServiceTier,
 	type ServiceTierByFamily,
+	type ToolCall,
+	type ToolResultMessage,
+	type Usage,
 } from "@oh-my-pi/pi-ai";
-import { getSessionsDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import type {
 	AgentType,
 	MessageStats,
 	SessionEntry,
 	SessionMessageEntry,
 	SessionServiceTierChangeEntry,
+	ToolCallStats,
+	ToolResultLink,
 	UserMessageLink,
 	UserMessageStats,
 } from "./types";
@@ -86,6 +91,14 @@ function isServiceTierChange(entry: SessionEntry): entry is SessionServiceTierCh
 }
 
 /**
+ * Check if an entry is a tool-result message.
+ */
+function isToolResultMessage(entry: SessionEntry): entry is SessionMessageEntry {
+	if (entry.type !== "message") return false;
+	return (entry as SessionMessageEntry).message?.role === "toolResult";
+}
+
+/**
  * Extract plain text from a user message content payload.
  */
 function extractUserText(content: unknown): string {
@@ -131,6 +144,14 @@ function extractUserStats(sessionFile: string, folder: string, entry: SessionMes
 
 /**
  * Extract stats from an assistant message entry.
+ *
+ * Session JSONL on disk is not guaranteed to match the current
+ * `AssistantMessage` shape: crash-truncated turns, sessions written by older
+ * versions, and foreign producers all flow through this parser. Every field
+ * returned here feeds a NOT NULL column in stats.db, so malformed entries are
+ * coerced (missing `stopReason`, token counts, `timestamp`) or skipped
+ * (missing `model`/`provider`/`api`/`usage`) instead of crashing the whole
+ * sync with a constraint violation.
  */
 function extractStats(
 	sessionFile: string,
@@ -141,6 +162,9 @@ function extractStats(
 ): MessageStats | null {
 	const msg = entry.message as AssistantMessage;
 	if (msg?.role !== "assistant") return null;
+	if (typeof msg.model !== "string" || typeof msg.provider !== "string" || typeof msg.api !== "string") return null;
+	const rawUsage = msg.usage as Partial<Usage> | undefined;
+	if (!rawUsage || typeof rawUsage !== "object") return null;
 
 	// Backfill: when the session recorded `priority` as the active service tier
 	// at this point but the AI usage payload was captured before priority
@@ -148,11 +172,29 @@ function extractStats(
 	// "Premium Reqs" stat aggregates priority traffic on re-sync. Trust any
 	// non-zero value already in `usage.premiumRequests` (Copilot multipliers or
 	// the new AI code path) and only synthesise when the field is missing/zero.
-	const recorded = msg.usage.premiumRequests ?? 0;
+	const recorded = rawUsage.premiumRequests ?? 0;
 	const model = { provider: msg.provider, api: msg.api, id: msg.model };
 	const tier = resolveModelServiceTier(currentServiceTier, model);
 	const derived = recorded > 0 ? recorded : getPriorityPremiumRequests(tier, model);
-	const usage = derived === recorded ? msg.usage : { ...msg.usage, premiumRequests: derived };
+	const wellFormed =
+		typeof rawUsage.input === "number" &&
+		typeof rawUsage.output === "number" &&
+		typeof rawUsage.cacheRead === "number" &&
+		typeof rawUsage.cacheWrite === "number" &&
+		typeof rawUsage.totalTokens === "number";
+	const usage: Usage =
+		wellFormed && derived === recorded
+			? (rawUsage as Usage)
+			: {
+					...rawUsage,
+					input: rawUsage.input ?? 0,
+					output: rawUsage.output ?? 0,
+					cacheRead: rawUsage.cacheRead ?? 0,
+					cacheWrite: rawUsage.cacheWrite ?? 0,
+					totalTokens: rawUsage.totalTokens ?? 0,
+					cost: rawUsage.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					premiumRequests: derived,
+				};
 
 	return {
 		sessionFile,
@@ -161,13 +203,88 @@ function extractStats(
 		model: msg.model,
 		provider: msg.provider,
 		api: msg.api,
-		timestamp: msg.timestamp,
+		timestamp: coerceEntryTimestamp(msg.timestamp, entry),
 		duration: msg.duration ?? null,
 		ttft: msg.ttft ?? null,
-		stopReason: msg.stopReason,
+		// A message persisted without a terminal stop reason never completed
+		// normally: classify by whether it carried an error.
+		stopReason: msg.stopReason ?? (msg.errorMessage ? "error" : "aborted"),
 		errorMessage: msg.errorMessage ?? null,
 		usage,
 		agentType,
+	};
+}
+
+/** Message timestamp, falling back to the entry's ISO timestamp, then 0. */
+function coerceEntryTimestamp(timestamp: number | undefined, entry: SessionMessageEntry): number {
+	if (typeof timestamp === "number" && Number.isFinite(timestamp)) return timestamp;
+	const ts = Date.parse(entry.timestamp);
+	return Number.isFinite(ts) ? ts : 0;
+}
+
+/**
+ * Extract one {@link ToolCallStats} per `toolCall` content block of an
+ * assistant message. Returns an empty array for turns without tool calls.
+ */
+function extractToolCalls(
+	sessionFile: string,
+	folder: string,
+	entry: SessionMessageEntry,
+	agentType: AgentType,
+): ToolCallStats[] {
+	const msg = entry.message as AssistantMessage;
+	if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return [];
+	// `tool_calls` columns are NOT NULL: skip turns that can't be attributed
+	// (malformed persisted entries — see extractStats) and blocks missing ids.
+	if (typeof msg.model !== "string" || typeof msg.provider !== "string") return [];
+
+	const blocks = msg.content.filter(
+		(block): block is ToolCall =>
+			block.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string",
+	);
+	if (blocks.length === 0) return [];
+
+	return blocks.map(block => {
+		let argsChars = 0;
+		try {
+			argsChars = JSON.stringify(block.arguments ?? {}).length;
+		} catch {
+			// Non-serializable arguments (shouldn't happen in persisted JSONL); size unknown.
+		}
+		return {
+			sessionFile,
+			entryId: entry.id,
+			toolCallId: block.id,
+			folder,
+			toolName: block.name,
+			model: msg.model,
+			provider: msg.provider,
+			timestamp: coerceEntryTimestamp(msg.timestamp, entry),
+			agentType,
+			callsInTurn: blocks.length,
+			argsChars,
+		};
+	});
+}
+
+/**
+ * Build the result linkage for a `toolResult` entry: text characters fed back
+ * into context plus the error flag, keyed to the originating call.
+ */
+function extractToolResultLink(sessionFile: string, entry: SessionMessageEntry): ToolResultLink | null {
+	const msg = entry.message as ToolResultMessage;
+	if (msg.role !== "toolResult" || typeof msg.toolCallId !== "string" || msg.toolCallId.length === 0) return null;
+	let resultChars = 0;
+	if (Array.isArray(msg.content)) {
+		for (const block of msg.content) {
+			if (block.type === "text" && typeof block.text === "string") resultChars += block.text.length;
+		}
+	}
+	return {
+		sessionFile,
+		toolCallId: msg.toolCallId,
+		resultChars,
+		isError: msg.isError === true,
 	};
 }
 
@@ -241,6 +358,8 @@ export interface ParseSessionResult {
 	stats: MessageStats[];
 	userStats: UserMessageStats[];
 	userLinks: UserMessageLink[];
+	toolCalls: ToolCallStats[];
+	toolResults: ToolResultLink[];
 	newOffset: number;
 }
 export async function parseSessionFile(sessionPath: string, fromOffset = 0): Promise<ParseSessionResult> {
@@ -248,7 +367,8 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 	try {
 		bytes = await Bun.file(sessionPath).bytes();
 	} catch (err) {
-		if (isEnoent(err)) return { stats: [], userStats: [], userLinks: [], newOffset: fromOffset };
+		if (isEnoent(err))
+			return { stats: [], userStats: [], userLinks: [], toolCalls: [], toolResults: [], newOffset: fromOffset };
 		throw err;
 	}
 
@@ -257,6 +377,8 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 	const stats: MessageStats[] = [];
 	const userStats: UserMessageStats[] = [];
 	const userLinks: UserMessageLink[] = [];
+	const toolCalls: ToolCallStats[] = [];
+	const toolResults: ToolResultLink[] = [];
 	const userByEntryId = new Map<string, UserMessageStats>();
 	const start = Math.max(0, Math.min(fromOffset, bytes.length));
 	const unprocessed = bytes.subarray(start);
@@ -278,9 +400,15 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 			}
 			continue;
 		}
+		if (isToolResultMessage(entry)) {
+			const link = extractToolResultLink(sessionPath, entry);
+			if (link) toolResults.push(link);
+			continue;
+		}
 		if (isAssistantMessage(entry)) {
 			const msgStats = extractStats(sessionPath, folder, entry, currentServiceTier, agentType);
 			if (msgStats) stats.push(msgStats);
+			toolCalls.push(...extractToolCalls(sessionPath, folder, entry, agentType));
 			// Link assistant's responding model back to the user message it answered.
 			const parentId = (entry as SessionMessageEntry).parentId;
 			if (parentId) {
@@ -303,7 +431,7 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 		}
 	}
 
-	return { stats, userStats, userLinks, newOffset: start + read };
+	return { stats, userStats, userLinks, toolCalls, toolResults, newOffset: start + read };
 }
 
 /**
@@ -350,19 +478,16 @@ export async function listAllSessionFiles(): Promise<string[]> {
  * Find a specific entry in a session file.
  */
 export async function getSessionEntry(sessionPath: string, entryId: string): Promise<SessionEntry | null> {
-	let bytes: Uint8Array;
 	try {
-		bytes = await Bun.file(sessionPath).bytes();
+		for await (const line of readLines(Bun.file(sessionPath).stream())) {
+			const entry = parseJsonLine(line, 0, line.length);
+			if (entry && "id" in entry && entry.id === entryId) {
+				return entry;
+			}
+		}
 	} catch (err) {
 		if (isEnoent(err)) return null;
 		throw err;
-	}
-
-	const { entries } = parseSessionEntriesLenient(bytes);
-	for (const entry of entries) {
-		if ("id" in entry && entry.id === entryId) {
-			return entry;
-		}
 	}
 	return null;
 }

@@ -8,7 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getProjectDir, readJsonl, Snowflake } from "@oh-my-pi/pi-utils";
-import { type Subprocess, spawn } from "bun";
+import type { Subprocess } from "bun";
 import { hostHasInheritableConsole } from "../../eval/py/spawn-options";
 import type {
 	JsonRpcError,
@@ -37,12 +37,17 @@ export interface StdioSpawnCommand {
 	 */
 	windowsHide?: boolean;
 	/**
-	 * Run the subprocess in its own session.
+	 * Run the subprocess in its own session when the platform can safely do so.
 	 *
-	 * POSIX: `true`. Detach → `setsid`, so the MCP process tree has no
-	 * controlling terminal and terminal job-control signals (Ctrl+Z SIGTSTP,
+	 * Linux/other POSIX: `true`. Detach → `setsid`, so the MCP process tree has
+	 * no controlling terminal and terminal job-control signals (Ctrl+Z SIGTSTP,
 	 * background-read SIGTTIN) cannot stop stdio servers such as
 	 * `chrome-devtools-mcp` and leave our read loop blocked on silent pipes.
+	 *
+	 * macOS: `false`. LaunchServices/TCC attributes Apple Events automation to
+	 * the responsible terminal process only while the child stays in the
+	 * inherited session; detaching via `setsid` prevents the permission prompt
+	 * for servers such as `xcrun mcpbridge` (#4987).
 	 *
 	 * Windows: `false`. There is no SIGTSTP/SIGTTIN to escape, and Windows
 	 * wrapper chains must stay in the OMP console session so nested console
@@ -247,7 +252,7 @@ export async function resolveStdioSpawnCommand(
 	options: ResolveStdioSpawnOptions,
 ): Promise<StdioSpawnCommand> {
 	const args = config.args ?? [];
-	if (options.platform !== "win32") return { cmd: [config.command, ...args], detached: true };
+	if (options.platform !== "win32") return { cmd: [config.command, ...args], detached: options.platform !== "darwin" };
 
 	const windowsHide = options.hostHasInheritableConsole === undefined ? true : !options.hostHasInheritableConsole;
 	const resolved = await resolveWindowsCommandPath(config.command, options.cwd, options.env);
@@ -366,12 +371,16 @@ export class StdioTransport implements MCPTransport {
 		});
 
 		// Platform-derived session and console-window handling come from
-		// `resolveStdioSpawnCommand`: POSIX detaches into its own session to
-		// escape terminal job-control signals (SIGTSTP, SIGTTIN); Windows stays
-		// attached, and only hides the child when the host has no console to
-		// share. See `StdioSpawnCommand`.
-		this.#process = spawn({
-			cmd: spawnCommand.cmd,
+		// `resolveStdioSpawnCommand`: Linux/other POSIX detach into their own
+		// session to escape terminal job-control signals (SIGTSTP, SIGTTIN);
+		// macOS stays attached so TCC can prompt for Apple Events automation;
+		// Windows stays attached, and only hides the child when the host has no
+		// console to share. See `StdioSpawnCommand`.
+		// Keep this on Bun's argv-first overload. The eval JS kernel path that
+		// triggers macOS Apple Events TCC prompts uses the same shape; the
+		// one-object `{ cmd }` overload timed out before prompting for `mcpbridge`
+		// even with `detached: false` (#5085).
+		this.#process = Bun.spawn(spawnCommand.cmd, {
 			cwd,
 			env,
 			stdin: "pipe",
@@ -575,17 +584,27 @@ export class StdioTransport implements MCPTransport {
 
 		const stdin = this.#process.stdin;
 		const message = `${JSON.stringify(request)}\n`;
-		try {
-			// Await both: Bun's FileSink can surface a broken pipe either as a
-			// synchronous throw or as a rejected Promise (the EPIPE arrives on a
-			// processTicksAndRejections tick). Awaiting funnels both into this catch
-			// so the request rejects cleanly instead of leaving a floating rejected
-			// promise that crashes the process via the unhandledRejection handler.
-			await stdin.write(message);
-			await stdin.flush();
-		} catch (error: unknown) {
+		const failFromSend = (error: unknown) => {
+			if (settled) return;
 			cleanup();
 			reject(error instanceof Error ? error : new Error(String(error)));
+		};
+		try {
+			// Never `await` write/flush. Bun's FileSink returns a pending Promise
+			// once the OS pipe buffer fills (default ~64 KB on POSIX), and a
+			// subprocess that stops draining stdin will park those awaits forever.
+			// Awaiting here would keep the async fn stuck above `return promise`,
+			// past the timeout timer and the abort handler, orphaning the deferred
+			// rejection and hanging the caller (#3945). Route sync throws (Windows
+			// EPIPE) and async rejections (POSIX EPIPE on processTicksAndRejections)
+			// into `reject()` while leaving the returned promise free to settle
+			// from the response, timer, abort signal, or read-loop transport-close.
+			const wrote = stdin.write(message);
+			if (isThenable(wrote)) wrote.then(undefined, failFromSend);
+			const flushed = stdin.flush();
+			if (isThenable(flushed)) flushed.then(undefined, failFromSend);
+		} catch (error) {
+			failFromSend(error);
 		}
 
 		return promise;

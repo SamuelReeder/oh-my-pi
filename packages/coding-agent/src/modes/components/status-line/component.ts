@@ -4,7 +4,6 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
@@ -118,7 +117,15 @@ function messageFingerprint(msg: AgentMessage): string {
 					redactedLen += b.data.length;
 				} else if (b.type === "toolCall") {
 					if (typeof b.name === "string") textLen += b.name.length;
-					textLen += b.arguments === undefined ? 0 : JSON.stringify(b.arguments).length;
+					if (b.arguments !== undefined) {
+						try {
+							textLen += JSON.stringify(b.arguments, (_key, value) =>
+								typeof value === "bigint" ? value.toString() : value,
+							).length;
+						} catch {
+							textLen += String(b.arguments).length;
+						}
+					}
 				}
 			}
 		}
@@ -268,6 +275,7 @@ export class StatusLineComponent implements Component {
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
+	#vibeModeStatus: { enabled: boolean } | null = null;
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
 	#activeRepoCache: ActiveRepoCache | undefined;
@@ -496,6 +504,10 @@ export class StatusLineComponent implements Component {
 		this.#goalModeStatus = status ?? null;
 	}
 
+	setVibeModeStatus(status: { enabled: boolean } | undefined): void {
+		this.#vibeModeStatus = status ?? null;
+	}
+
 	setCollabStatus(status: CollabStatus | null): void {
 		this.#collabStatus = status;
 	}
@@ -699,14 +711,22 @@ export class StatusLineComponent implements Component {
 				}
 			};
 			try {
-				// Requires `gh repo set-default` to be configured; fails gracefully if not
-				const result = await $`gh pr view --json number,url`.cwd(lookupCwd).quiet().nothrow();
+				// Route through the shared `gh` helper so the child inherits
+				// `GH_NON_INTERACTIVE_ENV` (disables terminal/keychain prompts) and
+				// hard-terminates on the git command deadline instead of stalling
+				// the status-line indefinitely (#4234). Requires `gh repo set-default`;
+				// non-zero exit still falls through to the null cache below.
+				const result = await git.github.run(
+					lookupCwd,
+					["pr", "view", "--json", "number,url"],
+					AbortSignal.timeout(git.GIT_COMMAND_TIMEOUT_MS),
+				);
 				if (this.#disposed) return;
 				if (result.exitCode !== 0) {
 					setCachedPr(null);
 					return;
 				}
-				const pr = JSON.parse(result.stdout.toString()) as { number: number; url: string };
+				const pr = JSON.parse(result.stdout) as { number: number; url: string };
 				if (typeof pr.number === "number") {
 					setCachedPr({ number: pr.number, url: pr.url });
 				} else {
@@ -983,6 +1003,10 @@ export class StatusLineComponent implements Component {
 			output: 0,
 			cacheRead: 0,
 			cacheWrite: 0,
+			totalTokens: 0,
+			orchestrationInput: 0,
+			orchestrationOutput: 0,
+			orchestrationCacheRead: 0,
 			premiumRequests: 0,
 			cost: 0,
 		};
@@ -1028,6 +1052,7 @@ export class StatusLineComponent implements Component {
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
+			vibeMode: this.#vibeModeStatus,
 			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,
@@ -1216,9 +1241,21 @@ export class StatusLineComponent implements Component {
 					}
 				}
 			}
+			const leftOverflowDropIndex = (): number => {
+				// Preserve the current working directory as long as possible. The
+				// previous right-to-left pop could collapse a normal-width bar to
+				// just the model segment, hiding the path before less-critical left
+				// segments such as model/mode/collab were removed.
+				for (let i = leftSegIds.length - 1; i >= 0; i--) {
+					if (leftSegIds[i] !== "path") return i;
+				}
+				return left.length - 1;
+			};
+
 			while (totalWidth() > topFillWidth && left.length > 0) {
-				left.pop();
-				leftSegIds.pop();
+				const dropIdx = leftOverflowDropIndex();
+				left.splice(dropIdx, 1);
+				leftSegIds.splice(dropIdx, 1);
 				leftWidth = groupWidth(left, leftCapWidth, leftSepWidth);
 			}
 		}

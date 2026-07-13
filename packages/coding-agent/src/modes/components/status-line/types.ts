@@ -67,6 +67,9 @@ export interface SegmentContext {
 		enabled: boolean;
 		paused: boolean;
 	} | null;
+	vibeMode: {
+		enabled: boolean;
+	} | null;
 	collab: CollabStatus | null;
 	// Cached values for performance (computed once per render)
 	usageStats: {
@@ -74,6 +77,10 @@ export interface SegmentContext {
 		output: number;
 		cacheRead: number;
 		cacheWrite: number;
+		totalTokens: number;
+		orchestrationInput: number;
+		orchestrationOutput: number;
+		orchestrationCacheRead: number;
 		premiumRequests: number;
 		cost: number;
 		tokensPerSecond: number | null;

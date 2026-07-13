@@ -117,7 +117,7 @@ export const TAB_METADATA: Record<SettingTab, { label: string; icon: `tab.${stri
  */
 export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 	appearance: ["Theme", "Status Line", "Display", "Images"],
-	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Vision"],
+	model: ["Thinking", "Sampling", "Prompt", "Retry & Fallback", "Advisor", "Downshift", "Vision"],
 	interaction: [
 		"Input",
 		"Approvals",
@@ -233,7 +233,7 @@ interface StringDef {
 
 interface NumberDef {
 	type: "number";
-	default: number;
+	default: number | undefined;
 	ui?: UiNumber;
 }
 
@@ -285,6 +285,7 @@ const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_STRING_RECORD: Record<string, string> = {};
 const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
+const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["job", "irc"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
@@ -329,6 +330,25 @@ export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 			"^\\s*(echo|printf|cat\\s*<<)\\s+(?:(?:[^\"'>]|\"[^\"]*\"|'[^']*')|(?<!\\|)>{1,2}\\|?\\s*(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))*(?<!\\|)>{1,2}\\|?\\s*(?!(?:\"/dev/(?:null|tty|stdout|stderr)\"|'/dev/(?:null|tty|stdout|stderr)'|/dev/(?:null|tty|stdout|stderr))(?:[\\s;&|]|$))[$\\w./~\"'-]",
 		tool: "write",
 		message: "Use the `write` tool instead of echo/cat redirection. It handles encoding and provides confirmation.",
+	},
+	{
+		pattern: "^\\s*nohup\\s+|(?<!&)\\&\\s*$",
+		tool: "launch",
+		message:
+			"Use the `launch` tool instead of nohup or background shell syntax so the process stays observable and managed.",
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?(?:dev|start)(?:\\s|$)|(?:vite|next\\s+dev|nuxt\\s+dev|nodemon|lldb|gdb|tail\\s+-f)(?:\\s|$)|docker\\s+compose\\s+up(?!.*(?:\\s-d(?:\\s|$)|--detach))(?:\\s|$))",
+		tool: "launch",
+		message:
+			"Use the `launch` tool for services, watchers, and debuggers so other omp instances can observe and control them.",
+	},
+	{
+		pattern:
+			"^\\s*(?:(?:bun|npm|pnpm|yarn)\\s+(?:run\\s+)?\\S+|cargo\\s+watch|watchexec|pytest|vitest|jest|tsc)(?:.|\\n)*(?:--watch|-w)(?:\\s|$)",
+		tool: "launch",
+		message: "Use the `launch` tool for watch mode so its output, input, and lifecycle stay managed.",
 	},
 ];
 
@@ -400,6 +420,17 @@ export const SETTINGS_SCHEMA = {
 			label: "Enable Advisor",
 			description:
 				"Pair a second model (assigned to the 'advisor' role) that passively reviews each turn and injects notes.",
+		},
+	},
+	"downshift.enabled": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Downshift",
+			label: "Enable Downshift",
+			description:
+				"Start on the active model, then switch to a fast/cheap model (default the 'smol' role) at the first edit/write after the plan nudge's todo list exists — the strong model plans, commits the todos, and starts the implementation before handing off. Overridable per session with --downshift / --no-downshift.",
 		},
 	},
 	"advisor.subagents": {
@@ -917,6 +948,18 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"display.collapseCompacted": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			group: "Display",
+			label: "Collapse Compacted History",
+			description:
+				"Collapse pre-compaction history behind the summary divider on the live transcript; disable to keep the full transcript inline with dividers at each compaction point",
+		},
+	},
+
 	showHardwareCursor: {
 		type: "boolean",
 		default: true, // will be computed based on platform if undefined
@@ -935,7 +978,7 @@ export const SETTINGS_SCHEMA = {
 	// Reasoning and prompts
 	defaultThinkingLevel: {
 		type: "enum",
-		values: [...THINKING_EFFORTS, AUTO_THINKING, "max"],
+		values: [...THINKING_EFFORTS, AUTO_THINKING],
 		default: "high",
 		ui: {
 			tab: "model",
@@ -989,7 +1032,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			group: "Thinking",
 			label: "Loop Guard",
-			description: "Enable automatic stream loop detection for Gemini and DeepSeek models",
+			description: "Enable automatic stream loop detection for model reasoning and prose",
 		},
 	},
 
@@ -1013,6 +1056,39 @@ export const SETTINGS_SCHEMA = {
 			label: "Loop Guard Tool-Call Reminder",
 			description:
 				"When a Gemini reasoning stream emits many consecutive planning headers without calling a tool, interrupt it and inject a reminder to issue a tool call (requires Loop Guard)",
+		},
+	},
+
+	"model.toolCallLoopGuard.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Guard",
+			description: "Detect consecutive identical tool calls across turns and inject a corrective steer",
+		},
+	},
+
+	"model.toolCallLoopGuard.threshold": {
+		type: "number",
+		default: 5,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Threshold",
+			description: "Consecutive identical tool calls required before the corrective steer is injected",
+		},
+	},
+
+	"model.toolCallLoopGuard.exemptTools": {
+		type: "array",
+		default: DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Tool-Call Loop Exempt Tools",
+			description: "Tool names that may repeat consecutively without triggering the cross-turn loop guard",
 		},
 	},
 
@@ -1205,7 +1281,7 @@ export const SETTINGS_SCHEMA = {
 	textVerbosity: {
 		type: "enum",
 		values: ["low", "medium", "high"] as const,
-		default: "high",
+		default: "medium",
 		ui: {
 			tab: "model",
 			group: "Sampling",
@@ -1213,8 +1289,8 @@ export const SETTINGS_SCHEMA = {
 			description: "OpenAI Responses and Codex response verbosity (low, medium, or high)",
 			options: [
 				{ value: "low", label: "Low", description: "Prefer concise responses" },
-				{ value: "medium", label: "Medium", description: "Balance brevity and detail" },
-				{ value: "high", label: "High", description: "Prefer detailed responses (default)" },
+				{ value: "medium", label: "Medium", description: "Balance brevity and detail (default)" },
+				{ value: "high", label: "High", description: "Prefer detailed responses" },
 			],
 		},
 	},
@@ -1333,7 +1409,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
-	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
+	"retry.fallbackChains": {
+		type: "record",
+		default: {} as Record<string, string[]>,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Retry Fallback Chains",
+			description:
+				'JSON object mapping model roles, model selectors ("provider/model-id"), or provider wildcards ("provider/*") to ordered fallback selectors, e.g. {"default":["openai/gpt-4o-mini"],"google-antigravity/*":["google/*","google-vertex/*"]}. Model-oriented keys apply whenever that model/provider is active, regardless of role; a "provider/*" entry keeps the failing model\'s id and swaps the provider.',
+		},
+	},
 	"retry.fallbackRevertPolicy": {
 		type: "enum",
 		values: ["cooldown-expiry", "never"] as const,
@@ -1351,6 +1437,18 @@ export const SETTINGS_SCHEMA = {
 				},
 				{ value: "never", label: "Never", description: "Stay on the fallback model until manually changed" },
 			],
+		},
+	},
+
+	"providers.anthropic.serverSideFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Anthropic Server-Side Fallback (Fable 5)",
+			description:
+				"When a Claude Fable 5 / Mythos 5 request is blocked by Anthropic's safety classifier, retry it on Claude Opus 4.8 server-side (Anthropic `server-side-fallback-2026-06-01` beta). Opt-in — leaving this off preserves the pre-fallback behavior for every request.",
 		},
 	},
 
@@ -1963,7 +2061,11 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	"compaction.reserveTokens": { type: "number", default: 16384 },
+	// No default: an unset reserve tells the compaction layer the user never
+	// chose one, so small-window recovery may swap in the proportional reserve
+	// (see resolveBudgetReserveTokens). A materialized 16384 here would make
+	// every session look explicitly configured.
+	"compaction.reserveTokens": { type: "number", default: undefined },
 
 	"compaction.keepRecentTokens": { type: "number", default: 20000 },
 
@@ -2217,6 +2319,11 @@ export const SETTINGS_SCHEMA = {
 					label: "8x13 on 11px advance (tracking), black",
 					description:
 						"8x13 glyphs on an 11x16 cell — extra letter spacing so characters don't merge. Default for Anthropic.",
+				},
+				{
+					value: "silver16-bw",
+					label: "Silver 16, CJK",
+					description: "Embedded Silver TrueType font on a 16px grid for CJK and other non-Latin text.",
 				},
 				{
 					value: "doc-8on16-bw",
@@ -3116,18 +3223,6 @@ export const SETTINGS_SCHEMA = {
 	},
 	"bashInterceptor.patterns": { type: "array", default: DEFAULT_BASH_INTERCEPTOR_RULES },
 
-	"bash.stripTrailingHeadTail": {
-		type: "boolean",
-		default: true,
-		ui: {
-			tab: "shell",
-			group: "Bash",
-			label: "Strip head/tail Pipes",
-			description:
-				"Silently drop trailing `| head`/`| tail` pipes from single-line bash commands. Output is already truncated automatically.",
-		},
-	},
-
 	// Shell output minimizer
 	"shellMinimizer.enabled": {
 		type: "boolean",
@@ -3465,6 +3560,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"launch.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Launch",
+			description: "Enable the launch tool for supervising shared long-running project processes",
+		},
+	},
+
 	"speechgen.enabled": {
 		type: "boolean",
 		default: false,
@@ -3577,6 +3683,17 @@ export const SETTINGS_SCHEMA = {
 			group: "Available Tools",
 			label: "Web Search",
 			description: "Enable the web_search tool for live web results",
+		},
+	},
+
+	"ask.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tools",
+			group: "Available Tools",
+			label: "Ask",
+			description: "Enable the ask tool for interactive user questions",
 		},
 	},
 
@@ -4089,19 +4206,31 @@ export const SETTINGS_SCHEMA = {
 
 	"task.softRequestBudget": {
 		type: "number",
-		default: 90,
+		default: 200,
 		ui: {
 			tab: "tasks",
 			group: "Subagents",
 			label: "Soft Subagent Request Budget",
 			description:
-				"Soft per-subagent request budget (assistant requests per run). Crossing it injects one steering notice asking the subagent to wrap up; at 1.5x the budget the run is aborted gracefully, salvaging partial output. 0 disables the guard. Bundled explore/sonic agents use a lower built-in budget.",
+				"Soft per-subagent request budget (assistant requests per run). Crossing it injects a wrap-up steering notice (see task.softRequestBudgetNotice); at 1.5x the budget the run is force-stopped and the agent must yield its partial findings. 0 disables the guard. Bundled scout/sonic agents use a lower built-in budget.",
 			options: [
 				{ value: "0", label: "Disabled" },
-				{ value: "40", label: "40 requests" },
-				{ value: "90", label: "90 requests", description: "Default" },
+				{ value: "90", label: "90 requests" },
 				{ value: "150", label: "150 requests" },
+				{ value: "200", label: "200 requests", description: "Default" },
 			],
+		},
+	},
+
+	"task.softRequestBudgetNotice": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Soft Request Budget Notice",
+			description:
+				"Inject one steering notice when a subagent crosses its soft request budget, asking it to wrap up before the 1.5x forced-yield stop.",
 		},
 	},
 
@@ -4275,6 +4404,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Providers that web_search should never use, even as fallbacks",
 		},
 	},
+	"providers.webSearchGeminiModel": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Gemini web_search model",
+			description: "Model ID for Gemini Google Search grounding. Defaults to gemini-2.5-flash.",
+		},
+	},
 	"providers.antigravityEndpoint": {
 		type: "enum",
 		values: ["auto", "production", "sandbox"] as const,
@@ -4427,6 +4566,17 @@ export const SETTINGS_SCHEMA = {
 				{ value: "assistant", label: "Assistant messages" },
 				{ value: "yield", label: "Final message only" },
 			],
+		},
+	},
+	"speech.enhanced": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "providers",
+			group: "Services",
+			label: "Enhanced Speech Rewriting",
+			description:
+				"Rewrite assistant output into natural spoken prose with the tiny/smol model before synthesis (describes code, drops links and markdown). Falls back to mechanical cleanup on failure",
 		},
 	},
 	"speech.voice": {
@@ -4878,6 +5028,8 @@ export const SETTINGS_SCHEMA = {
 	"thinkingBudgets.high": { type: "number", default: 16384 },
 
 	"thinkingBudgets.xhigh": { type: "number", default: 32768 },
+
+	"thinkingBudgets.max": { type: "number", default: 32768 },
 } as const;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4896,17 +5048,19 @@ export type SettingValue<P extends SettingPath> = Schema[P] extends { type: "boo
 		? boolean
 		: Schema[P] extends { type: "string" }
 			? string | undefined
-			: Schema[P] extends { type: "number" }
-				? number
-				: Schema[P] extends { type: "enum"; values: infer V }
-					? V extends readonly string[]
-						? V[number]
-						: never
-					: Schema[P] extends { type: "array"; default: infer D }
-						? D
-						: Schema[P] extends { type: "record"; default: infer D }
+			: Schema[P] extends { type: "number"; default: undefined }
+				? number | undefined
+				: Schema[P] extends { type: "number" }
+					? number
+					: Schema[P] extends { type: "enum"; values: infer V }
+						? V extends readonly string[]
+							? V[number]
+							: never
+						: Schema[P] extends { type: "array"; default: infer D }
 							? D
-							: never;
+							: Schema[P] extends { type: "record"; default: infer D }
+								? D
+								: never;
 
 /** Get the default value for a setting path */
 export function getDefault<P extends SettingPath>(path: P): SettingValue<P> {
@@ -4968,7 +5122,7 @@ export interface CompactionSettings {
 	strategy: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
-	reserveTokens: number;
+	reserveTokens: number | undefined;
 	keepRecentTokens: number;
 	midTurnEnabled: boolean;
 	handoffSaveToDisk: boolean;
@@ -5092,6 +5246,7 @@ export interface ThinkingBudgetsSettings {
 	medium: number;
 	high: number;
 	xhigh: number;
+	max: number;
 }
 
 export interface SttSettings {

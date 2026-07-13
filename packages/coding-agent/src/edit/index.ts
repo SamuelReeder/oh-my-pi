@@ -4,18 +4,13 @@ import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "tex
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import {
-	createLspWritethrough,
-	type FileDiagnosticsResult,
-	type WritethroughCallback,
-	type WritethroughDeferredHandle,
-	writethroughNoop,
-} from "../lsp";
+import { createLspWritethrough, flushLspWritethroughBatch, type WritethroughCallback, writethroughNoop } from "../lsp";
+import { DeferredDiagnostics } from "../lsp/deferred-diagnostics";
 import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
-import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
+import type { ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { isInternalUrlPath } from "../tools/path-utils";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
@@ -129,6 +124,8 @@ async function executeApplyPatchPerFile(
 		run: (batchRequest: LspBatchRequest | undefined) => Promise<AgentToolResult<EditToolDetails>>;
 	}[],
 	outerBatchRequest: LspBatchRequest | undefined,
+	cwd: string,
+	signal: AbortSignal | undefined,
 	onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
 ): Promise<AgentToolResult<EditToolDetails, TInput>> {
 	if (fileEntries.length === 1) {
@@ -138,10 +135,15 @@ async function executeApplyPatchPerFile(
 
 	const perFileResults: EditToolPerFileResult[] = [];
 	const contentTexts: string[] = [];
+	let hasError = false;
 
 	for (let i = 0; i < fileEntries.length; i++) {
 		const { path, run } = fileEntries[i];
 		const isLast = i === fileEntries.length - 1;
+		// Per-file writes join the outer LSP write batch; only the last entry
+		// flushes it, so cross-file writes coalesce into a single
+		// format+diagnostics pass. The failure path below flushes explicitly
+		// when the loop stops early.
 		const batchRequest: LspBatchRequest | undefined = outerBatchRequest
 			? { id: outerBatchRequest.id, flush: isLast && outerBatchRequest.flush }
 			: undefined;
@@ -169,6 +171,36 @@ async function executeApplyPatchPerFile(
 			const displayErrorText = err instanceof HashlineMismatchError ? err.displayMessage : undefined;
 			perFileResults.push({ path, diff: "", isError: true, errorText, displayErrorText });
 			contentTexts.push(`Error editing ${path}: ${errorText}`);
+			hasError = true;
+			// Later entries were authored assuming this file's post-state; a
+			// partial cascade after failure typically compounds damage. Stop
+			// here, report applied vs. skipped, and let the caller re-issue
+			// only the failed and unapplied files. Matches
+			// `executeSinglePathEntries` semantics.
+			if (i > 0) {
+				const appliedPaths = fileEntries
+					.slice(0, i)
+					.map(e => e.path)
+					.join(", ");
+				contentTexts.push(`Files already applied: ${appliedPaths}.`);
+			}
+			if (i + 1 < fileEntries.length) {
+				const skippedPaths = fileEntries
+					.slice(i + 1)
+					.map(e => e.path)
+					.join(", ");
+				contentTexts.push(
+					`Files NOT applied: ${skippedPaths}; re-read the affected files and re-issue only the failed and unapplied files.`,
+				);
+			}
+			// Stopping early skips the last-entry flush above; finalize the
+			// already-written files so an intervening failure cannot leave them
+			// sitting in an unfinalized LSP write batch (mirrors the delete-path
+			// flush in executePatchSingle).
+			if (outerBatchRequest?.flush) {
+				await flushLspWritethroughBatch(outerBatchRequest.id, cwd, signal);
+			}
+			break;
 		}
 
 		// Emit partial result after each file so UI shows progressive completion
@@ -197,6 +229,10 @@ async function executeApplyPatchPerFile(
 			firstChangedLine: perFileResults.find(r => r.firstChangedLine)?.firstChangedLine,
 			perFileResults,
 		}),
+		// Any per-file failure marks the aggregate result as an error so the
+		// agent loop and renderer take the error branch instead of treating
+		// a mixed partial application as a successful edit.
+		...(hasError ? { isError: true } : {}),
 	};
 }
 
@@ -204,7 +240,9 @@ async function executeSinglePathEntries(
 	path: string,
 	runs: ((batchRequest: LspBatchRequest | undefined) => Promise<AgentToolResult<EditToolDetails>>)[],
 	outerBatchRequest: LspBatchRequest | undefined,
-	onUpdate?: (partialResult: AgentToolResult<EditToolDetails, TInput>) => void,
+	onUpdate: ((partialResult: AgentToolResult<EditToolDetails, TInput>) => void) | undefined,
+	cwd: string,
+	signal: AbortSignal | undefined,
 ): Promise<AgentToolResult<EditToolDetails, TInput>> {
 	if (runs.length === 1) {
 		return runs[0](outerBatchRequest);
@@ -213,7 +251,7 @@ async function executeSinglePathEntries(
 	const contentTexts: string[] = [];
 	const diffTexts: string[] = [];
 	let firstChangedLine: number | undefined;
-	let errorCount = 0;
+	let hasError = false;
 	let metadataPath: string | undefined;
 	let hasFirstOldText = false;
 	let firstOldText: string | undefined;
@@ -264,10 +302,13 @@ async function executeSinglePathEntries(
 						`; re-read the file and re-issue only the failed and unapplied entries.`,
 				);
 			}
-			errorCount++;
+			hasError = true;
 			// Stop at the first failure: later entries were authored against
 			// line numbers/content that assumed this entry succeeded, and
 			// applying them after a failure compounds the damage.
+			if (outerBatchRequest?.flush) {
+				await flushLspWritethroughBatch(outerBatchRequest.id, cwd, signal);
+			}
 			break;
 		}
 
@@ -278,7 +319,7 @@ async function executeSinglePathEntries(
 					diff: diffTexts.join("\n"),
 					firstChangedLine,
 				},
-				...(errorCount > 0 ? { isError: true } : {}),
+				...(hasError ? { isError: true } : {}),
 			});
 		}
 	}
@@ -300,7 +341,7 @@ async function executeSinglePathEntries(
 		// renderer takes the error branch instead of falling through to the
 		// streaming-edit preview (which displays the *proposed* diff and looks
 		// indistinguishable from success).
-		...(errorCount > 0 ? { isError: true } : {}),
+		...(hasError ? { isError: true } : {}),
 	};
 }
 
@@ -337,12 +378,7 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #fuzzyThreshold: number;
 	readonly #writethrough: WritethroughCallback;
 	readonly #editMode?: EditMode;
-	readonly #dedupDiagnostics: boolean;
-	readonly #pendingDeferredFetches = new Map<string, AbortController>();
-	/** Fallback per-path mutation counter used only when the session does not expose
-	 *  a shared one. Prefer `session.bumpFileMutationVersion` so write (and any other
-	 *  tool) mutating the same file also invalidates pending late-diagnostics. */
-	readonly #editVersionByPath = new Map<string, number>();
+	readonly #deferredDiagnostics: DeferredDiagnostics;
 
 	constructor(private readonly session: ToolSession) {
 		const {
@@ -354,10 +390,11 @@ export class EditTool implements AgentTool<TInput> {
 		this.#editMode = resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
-		this.#dedupDiagnostics =
+		const deduplicateDiagnostics =
 			(session.enableLsp ?? true) &&
 			session.settings.get("lsp.diagnosticsOnEdit") &&
 			session.settings.get("lsp.diagnosticsDeduplicate");
+		this.#deferredDiagnostics = new DeferredDiagnostics(session, deduplicateDiagnostics);
 		this.#writethrough = createEditWritethrough(session);
 	}
 
@@ -498,11 +535,14 @@ export class EditTool implements AgentTool<TInput> {
 								batchRequest: br,
 								allowFuzzy: tool.#allowFuzzy,
 								fuzzyThreshold: tool.#fuzzyThreshold,
+								// The JSON grammar has no `*** Update File`; its `op: "create"`
+								// doubles as the documented full-file overwrite (patch.md <avoid>).
+								allowCreateOverwrite: true,
 								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate);
+					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 			apply_patch: {
@@ -538,11 +578,11 @@ export class EditTool implements AgentTool<TInput> {
 									allowFuzzy: tool.#allowFuzzy,
 									fuzzyThreshold: tool.#fuzzyThreshold,
 									writethrough: tool.#writethrough,
-									beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+									beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 								}),
 						};
 					});
-					return executeApplyPatchPerFile(perFile, batchRequest, onUpdate);
+					return executeApplyPatchPerFile(perFile, batchRequest, tool.session.cwd, signal, onUpdate);
 				},
 			},
 			hashline: {
@@ -562,7 +602,7 @@ export class EditTool implements AgentTool<TInput> {
 						signal,
 						batchRequest,
 						writethrough: tool.#writethrough,
-						beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+						beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 					});
 				},
 			},
@@ -588,68 +628,12 @@ export class EditTool implements AgentTool<TInput> {
 								allowFuzzy: tool.#allowFuzzy,
 								fuzzyThreshold: tool.#fuzzyThreshold,
 								writethrough: tool.#writethrough,
-								beginDeferredDiagnosticsForPath: p => tool.#beginDeferredDiagnosticsForPath(p),
+								beginDeferredDiagnosticsForPath: p => tool.#deferredDiagnostics.begin(p),
 							}),
 					);
-					return executeSinglePathEntries(path, runs, batchRequest, onUpdate);
+					return executeSinglePathEntries(path, runs, batchRequest, onUpdate, tool.session.cwd, signal);
 				},
 			},
 		}[this.mode];
-	}
-
-	#beginDeferredDiagnosticsForPath(path: string): WritethroughDeferredHandle {
-		const existingDeferred = this.#pendingDeferredFetches.get(path);
-		if (existingDeferred) {
-			existingDeferred.abort();
-			this.#pendingDeferredFetches.delete(path);
-		}
-
-		const deferredController = new AbortController();
-		const editVersion = this.#bumpFileVersion(path);
-		return {
-			onDeferredDiagnostics: (lateDiagnostics: FileDiagnosticsResult) => {
-				this.#pendingDeferredFetches.delete(path);
-				this.#injectLateDiagnostics(path, lateDiagnostics, editVersion);
-			},
-			signal: deferredController.signal,
-			finalize: (diagnostics: FileDiagnosticsResult | undefined) => {
-				if (!diagnostics) {
-					this.#pendingDeferredFetches.set(path, deferredController);
-				} else {
-					deferredController.abort();
-				}
-			},
-		};
-	}
-
-	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult, editVersion: number): void {
-		const effective = this.#dedupDiagnostics
-			? getDiagnosticsLedger(this.session).reduce(path, diagnostics)
-			: diagnostics;
-		if (this.#dedupDiagnostics && effective.messages.length === 0) return;
-
-		const entry: DeferredDiagnosticsEntry = {
-			path,
-			summary: effective.summary ?? "",
-			messages: effective.messages ?? [],
-			errored: effective.errored,
-			// Drop at flush time if a later edit to the same file superseded this fetch.
-			isStale: () => this.#fileVersion(path) !== editVersion,
-		};
-		this.session.queueDeferredDiagnostics?.(entry);
-	}
-
-	/** Bump the file's mutation counter (session-global when available). */
-	#bumpFileVersion(path: string): number {
-		if (this.session.bumpFileMutationVersion) return this.session.bumpFileMutationVersion(path);
-		const next = (this.#editVersionByPath.get(path) ?? 0) + 1;
-		this.#editVersionByPath.set(path, next);
-		return next;
-	}
-
-	/** Read the file's current mutation counter (session-global when available). */
-	#fileVersion(path: string): number {
-		if (this.session.getFileMutationVersion) return this.session.getFileMutationVersion(path);
-		return this.#editVersionByPath.get(path) ?? 0;
 	}
 }

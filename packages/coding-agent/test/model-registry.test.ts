@@ -521,6 +521,9 @@ describe("ModelRegistry", () => {
 							supportsMultipleSystemMessages: false,
 							disableReasoningOnToolChoice: true,
 							allowsSyntheticReasoningContentForToolCalls: false,
+							includeEncryptedReasoning: false,
+							filterReasoningHistory: true,
+							replayNativeHistory: false,
 						},
 					},
 				},
@@ -623,6 +626,9 @@ describe("ModelRegistry", () => {
 				expect(getOpenAICompat(model)?.supportsMultipleSystemMessages).toBe(false);
 				expect(getOpenAICompat(model)?.disableReasoningOnToolChoice).toBe(true);
 				expect(getOpenAICompat(model)?.allowsSyntheticReasoningContentForToolCalls).toBe(false);
+				expect(getOpenAICompat(model)?.includeEncryptedReasoning).toBe(false);
+				expect(getOpenAICompat(model)?.filterReasoningHistory).toBe(true);
+				expect(getOpenAICompat(model)?.replayNativeHistory).toBe(false);
 			}
 		});
 
@@ -1125,6 +1131,7 @@ describe("ModelRegistry", () => {
 		let addHeaders: ModelRegistry;
 		let omitOnBuiltin: ModelRegistry;
 		let omitOnCustom: ModelRegistry;
+		let solOnlyReplay: ModelRegistry;
 		beforeAll(() => {
 			single = readonlyRegistry({
 				providers: {
@@ -1218,6 +1225,21 @@ describe("ModelRegistry", () => {
 					},
 				},
 			});
+			solOnlyReplay = readonlyRegistry({
+				providers: {
+					openai: {
+						modelOverrides: {
+							"gpt-5.6-sol": {
+								compat: {
+									includeEncryptedReasoning: false,
+									filterReasoningHistory: true,
+									replayNativeHistory: false,
+								},
+							},
+						},
+					},
+				},
+			});
 		});
 
 		test("model override applies to a single built-in model", () => {
@@ -1227,6 +1249,19 @@ describe("ModelRegistry", () => {
 			// Other models should be unchanged
 			const opus = models.find(m => m.id === "anthropic/claude-opus-4");
 			expect(opus?.name).not.toBe("Custom Sonnet Name");
+		});
+
+		test("model override limits Responses replay compatibility to Sol", () => {
+			const sol = solOnlyReplay.find("openai", "gpt-5.6-sol");
+			const terra = solOnlyReplay.find("openai", "gpt-5.6-terra");
+			const solCompat = sol?.compat as OpenAICompat | undefined;
+			const terraCompat = terra?.compat as OpenAICompat | undefined;
+			expect(solCompat?.includeEncryptedReasoning).toBe(false);
+			expect(solCompat?.filterReasoningHistory).toBe(true);
+			expect(solCompat?.replayNativeHistory).toBe(false);
+			expect(terraCompat?.includeEncryptedReasoning).toBe(true);
+			expect(terraCompat?.filterReasoningHistory).toBe(false);
+			expect(terraCompat?.replayNativeHistory).toBe(true);
 		});
 
 		test("model override with compat.openRouterRouting", () => {

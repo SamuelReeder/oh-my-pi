@@ -31,14 +31,17 @@ import { type Rule, ruleCapability, setActiveRules } from "./capability/rule";
 import { bucketRules } from "./capability/rule-buckets";
 import { shouldEnableAppendOnlyContext } from "./config/append-only-context-mode";
 import { shouldInlineToolDescriptors } from "./config/inline-tool-descriptors-mode";
-import { ModelRegistry } from "./config/model-registry";
+import { isAuthenticated, kNoAuth, ModelRegistry } from "./config/model-registry";
 import {
+	formatModelSelectorValue,
 	formatModelString,
+	formatModelStringWithRouting,
 	getModelMatchPreferences,
 	parseModelPattern,
 	parseModelString,
 	pickDefaultAvailableModel,
 	resolveAllowedModels,
+	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
@@ -106,7 +109,7 @@ import {
 	obfuscateProviderContext,
 	SecretObfuscator,
 } from "./secrets";
-import { AgentSession } from "./session/agent-session";
+import { AgentSession, type Downshift, type PlanYolo } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import {
@@ -135,6 +138,7 @@ import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
+	concreteThinkingLevel,
 	parseConfiguredThinkingLevel,
 	parseThinkingLevel,
 	resolveProvisionalAutoLevel,
@@ -157,6 +161,7 @@ import {
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
 	createTools,
+	createVibeTools,
 	type DeferredDiagnosticsEntry,
 	discoverStartupLspServers,
 	EditTool,
@@ -187,6 +192,7 @@ import {
 import { normalizeToolName, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { getImageGenTools } from "./tools/image-gen";
+import { isIrcEnabled } from "./tools/irc";
 import { wrapToolWithMetaNotice } from "./tools/output-meta";
 import { queueResolveHandler } from "./tools/resolve";
 import { ttsTool } from "./tools/tts";
@@ -390,13 +396,21 @@ export interface CreateAgentSessionOptions {
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
-	/** Raw model pattern string (e.g. from --model CLI flag) to resolve after extensions load.
+	/** Raw model pattern(s) (e.g. from --model CLI flag) to resolve after extensions load.
 	 * Used when model lookup is deferred because extension-provided models aren't registered yet. */
-	modelPattern?: string;
+	modelPattern?: string | string[];
+	/** Authenticated fallback selector for deferred subagent model patterns. */
+	modelPatternAuthFallback?: string;
+	/** Role name used to install retry fallbacks after deferred subagent patterns resolve. */
+	modelPatternFallbackRole?: string;
 	/** Thinking selector. Default: from settings, else unset */
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Models available for cycling (Ctrl+P in interactive mode) */
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/** Downshift from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
+	downshift?: Downshift;
+	/** Force read-only plan mode at start, auto-approve on the model's first resolve call, then switch to execute. */
+	planYolo?: PlanYolo;
 
 	/** Provider-facing system prompt override. Replaces the fully rendered default blocks. */
 	systemPrompt?: string | string[] | ((defaultPrompt: string[]) => string | string[]);
@@ -404,11 +418,22 @@ export interface CreateAgentSessionOptions {
 	customSystemPrompt?: string;
 	/** Already-loaded text appended through the bundled system prompt templates. */
 	appendSystemPrompt?: string;
+	/**
+	 * Already-loaded title-generation system prompt override (typically
+	 * {@link discoverTitleSystemPromptFile} → {@link resolvePromptInput}). When
+	 * set, every automatic session-title generation path on this session — the
+	 * first-input title and the replan-driven refresh — uses this prompt
+	 * instead of the bundled default. Refresh on cwd change via
+	 * {@link AgentSession.setTitleSystemPrompt}.
+	 */
+	titleSystemPrompt?: string;
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
 	/** Optional provider-facing prompt cache key, distinct from request lineage. */
 	providerPromptCacheKey?: string;
+	/** Whether `providerPromptCacheKey` is caller-pinned or inherited from a full fork. */
+	providerPromptCacheKeySource?: "explicit" | "fork";
 	/** Absolute wall-clock deadline in Unix epoch milliseconds. */
 	deadline?: number;
 
@@ -983,6 +1008,7 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 					success: event.success,
 					attempt: event.attempt,
 					finalError: event.finalError,
+					recoveredErrors: event.recoveredErrors,
 				},
 				ctx,
 			),
@@ -1203,6 +1229,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
+	const forkCacheShapeChanged =
+		options.model !== undefined ||
+		options.modelPattern !== undefined ||
+		options.thinkingLevel !== undefined ||
+		options.systemPrompt !== undefined ||
+		options.customSystemPrompt !== undefined ||
+		options.appendSystemPrompt !== undefined ||
+		options.toolNames !== undefined ||
+		options.customTools !== undefined;
+	const inheritedPromptCacheKey = forkCacheShapeChanged
+		? undefined
+		: sessionManager.getHeader()?.providerPromptCacheKey;
+	const providerPromptCacheKey = options.providerPromptCacheKey ?? inheritedPromptCacheKey;
+	const providerPromptCacheKeySource =
+		options.providerPromptCacheKey !== undefined
+			? (options.providerPromptCacheKeySource ?? "explicit")
+			: providerPromptCacheKey !== undefined
+				? "fork"
+				: undefined;
 	// Startup model *selection* only needs to know whether auth is configured for
 	// a candidate's provider — never the resolved key bytes. Use the synchronous,
 	// side-effect-free probe (`hasConfiguredAuth`): it refreshes no OAuth tokens,
@@ -1235,7 +1280,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 	const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
 
-	const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
+	const deferredModelPatterns = Array.isArray(options.modelPattern)
+		? options.modelPattern.map(pattern => pattern.trim()).filter(Boolean)
+		: options.modelPattern?.trim()
+			? [options.modelPattern.trim()]
+			: [];
+	const hasExplicitModel = options.model !== undefined || deferredModelPatterns.length > 0;
 	const modelMatchPreferences = getModelMatchPreferences(settings);
 	const allowedModels = await logger.time("resolveAllowedModels", () =>
 		resolveAllowedModels(modelRegistry, settings, modelMatchPreferences),
@@ -1244,7 +1294,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resolveModelRoleValue(settings.getModelRole("default"), allowedModels, {
 			settings,
 			matchPreferences: modelMatchPreferences,
-			modelRegistry,
 		}),
 	);
 	let model = options.model;
@@ -1259,14 +1308,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
 			: [];
 	let restoredSessionModelIndex = -1;
-	let restoredSessionThinkingLevel: ThinkingLevel | undefined;
+	let restoredSessionThinkingLevel: ConfiguredThinkingLevel | undefined;
 	if (!hasExplicitModel && !model && sessionModelStrings.length > 0) {
 		logger.time("restoreSessionModel", () => {
 			let failedSessionModel: string | undefined;
 			for (let i = 0; i < sessionModelStrings.length; i++) {
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
-					allowMaxAlias: true,
+					allowMaxSuffix: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) {
@@ -1334,7 +1384,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Concrete level the agent/session start with. With `auto` this is the
 	// provisional level shown until the first per-turn classification resolves;
 	// `auto` itself stays a session-only concept handled by AgentSession.
-	let effectiveThinkingLevel: ThinkingLevel | undefined = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+	let effectiveThinkingLevel: ThinkingLevel | undefined = concreteThinkingLevel(thinkingLevel);
 	if (model) {
 		const resolvedModel = model;
 		effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
@@ -1502,10 +1552,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// entries capture it at fetch time and are dropped at injection if a newer
 		// mutation (any tool) bumped it in the meantime.
 		const fileMutationVersions = new Map<string, number>();
+		const activeToolNames = new Set<string>();
+		const setActiveToolNames = (names: Iterable<string>): void => {
+			activeToolNames.clear();
+			for (const name of names) {
+				activeToolNames.add(name);
+			}
+		};
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
 			},
+			isToolActive: name => activeToolNames.has(name),
+			setActiveToolNames,
 			hasUI: options.hasUI ?? false,
 			enableLsp,
 			get hasEditTool() {
@@ -1568,6 +1627,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			activateDiscoveredTools: toolNames => session.activateDiscoveredTools(toolNames),
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
+			getLastCompletedRewind: () => session.getLastCompletedRewind(),
 			getToolChoiceQueue: () => session.toolChoiceQueue,
 			buildToolChoice: name => {
 				const m = session.model;
@@ -1692,37 +1752,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 							applyMCPEnvironment(mcpResult);
 							logMCPLoadErrors(mcpResult.errors);
-							// `tools.discoveryMode: "auto"` was resolved against a registry that
-							// held only built-ins plus persisted placeholder names. Recompute with
-							// the real MCP tool count: a large toolset must flip discovery on
-							// BEFORE the refresh, or activateAll would dump every MCP tool into
-							// the active set with no search_tool_bm25 registered.
+							// `tools.discoveryMode: "auto"` was resolved before deferred MCP
+							// tools existed. Reconcile again before refresh so a large toolset
+							// cannot bypass discovery by arriving after first paint.
 							let discoveryEnabled = activation.mcpDiscoveryEnabled;
 							let activateAll = activation.activateAllMCPTools;
-							if (!discoveryEnabled) {
-								const nonMCPToolNames = [...toolRegistry.keys()].filter(name => !isMCPToolName(name));
-								const projectedMode = resolveEffectiveToolDiscoveryMode(
-									settings,
-									countToolsForAutoDiscovery([...nonMCPToolNames, ...mcpResult.tools.map(tool => tool.name)]),
-								);
-								if (projectedMode !== "off") {
-									effectiveDiscoveryMode = projectedMode;
-									mcpDiscoveryEnabled = true;
-									discoveryEnabled = true;
-									activateAll = false;
-									liveSession.enableMCPDiscovery();
-									if (!toolRegistry.has("search_tool_bm25")) {
-										const searchTool: Tool = new SearchToolBm25Tool(toolSession);
-										toolRegistry.set(
-											searchTool.name,
-											new ExtensionToolWrapper(wrapToolWithMetaNotice(searchTool), extensionRunner) as Tool,
-										);
-									}
-									await liveSession.setActiveToolsByName([
-										...liveSession.getActiveToolNames(),
-										"search_tool_bm25",
-									]);
-								}
+							if (
+								!discoveryEnabled &&
+								(await enableDeferredMCPDiscoveryForTools(liveSession, mcpResult.tools))
+							) {
+								discoveryEnabled = true;
+								activateAll = false;
 							}
 							await liveSession.refreshMCPTools(mcpResult.tools, { activateAll });
 							if (activation.explicitlyRequestedMCPToolNames.length > 0) {
@@ -1730,7 +1770,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									// Discovery flipped on mid-flight: route the explicit request
 									// through discovery-aware activation so selection persists.
 									await liveSession.activateDiscoveredMCPTools(activation.explicitlyRequestedMCPToolNames);
-								} else if (!discoveryEnabled) {
+								} else if (!discoveryEnabled && !activateAll) {
 									await liveSession.setActiveToolsByName([
 										...liveSession.getActiveToolNames(),
 										...activation.explicitlyRequestedMCPToolNames,
@@ -1893,11 +1933,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
-		// Discover runtime (extension) provider catalogs now that they are
-		// registered. The startup refreshInBackground() ran before extensions
-		// loaded, so dynamic extension providers are only discovered here. Runs in
-		// the background (cache-aware) so startup is never blocked on the fetch; the
-		// model list re-renders when the catalog arrives, like other dynamic providers.
+		// Hydrate cached runtime (extension) provider catalogs before model
+		// resolution. Dynamic-only providers have no synchronous registration side
+		// effect, so a cold --model/provider resume must see the same fresh SQLite
+		// cache that `omp models find` uses before the online refresh continues in
+		// the background.
+		await modelRegistry.refreshRuntimeProviders("offline");
+		// Continue runtime discovery in the background (cache-aware) so startup is
+		// only blocked on local cache reads, not provider network fetches.
 		void modelRegistry.refreshRuntimeProviders().catch(error => {
 			logger.warn("runtime provider discovery failed", {
 				error: error instanceof Error ? error.message : String(error),
@@ -1916,7 +1959,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			for (let i = 0; i < sessionRetryLimit; i++) {
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
-					allowMaxAlias: true,
+					allowMaxSuffix: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) continue;
@@ -1931,7 +1975,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// `thinking.defaultLevel` must not become sticky.
 					thinkingLevel = pickInitialThinkingLevel(restoredModel);
 					autoThinking = thinkingLevel === AUTO_THINKING;
-					effectiveThinkingLevel = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+					effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
 					effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 						autoThinking
 							? resolveProvisionalAutoLevel(restoredModel)
@@ -1942,25 +1986,111 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			}
 		}
-		// Resolve deferred --model pattern now that extension models are registered.
-		if (!model && options.modelPattern) {
+		// Resolve deferred --model/subagent patterns now that extension models are
+		// registered. Expand role aliases (`pi/smol`) and comma chains to concrete
+		// selectors first so deferred resolution accepts everything the immediate
+		// path (resolveModelOverride → resolveModelRoleValue) accepts.
+		if (!model && deferredModelPatterns.length > 0) {
+			const expandedModelPatterns = resolveConfiguredModelPatterns(deferredModelPatterns, settings);
 			const availableModels = modelRegistry.getAll();
 			const matchPreferences = getModelMatchPreferences(settings);
-			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences, {
-				modelRegistry,
-			});
-			if (resolved) {
-				model = resolved;
+			for (let patternIndex = 0; patternIndex < expandedModelPatterns.length; patternIndex += 1) {
+				const pattern = expandedModelPatterns[patternIndex];
+				const primary = parseModelPattern(pattern, availableModels, matchPreferences);
+				if (!primary.model) continue;
+				let selectedModel = primary.model;
+				let selectedThinkingLevel = primary.thinkingLevel;
+				let selectedExplicitThinkingLevel = primary.explicitThinkingLevel;
+				let authFallbackUsed = false;
+				if (options.modelPatternAuthFallback) {
+					const primaryKey = await modelRegistry.getApiKey(primary.model);
+					if (primaryKey !== kNoAuth && !isAuthenticated(primaryKey)) {
+						const fallback = parseModelPattern(
+							options.modelPatternAuthFallback,
+							availableModels,
+							matchPreferences,
+						);
+						if (fallback.model) {
+							const fallbackKey = await modelRegistry.getApiKey(fallback.model);
+							if (isAuthenticated(fallbackKey)) {
+								selectedModel = fallback.model;
+								selectedThinkingLevel = fallback.thinkingLevel;
+								selectedExplicitThinkingLevel = fallback.explicitThinkingLevel;
+								authFallbackUsed = true;
+							}
+						}
+					}
+				}
+				if (!authFallbackUsed && options.modelPatternFallbackRole) {
+					const primarySelector = formatModelSelectorValue(
+						formatModelStringWithRouting(primary.model),
+						primary.thinkingLevel,
+					);
+					const seenSelectors = new Set<string>([primarySelector]);
+					const fallbackSelectors: string[] = [];
+					for (const fallbackPattern of expandedModelPatterns.slice(patternIndex + 1)) {
+						const fallback = parseModelPattern(fallbackPattern, availableModels, matchPreferences);
+						if (!fallback.model) continue;
+						const fallbackSelector = formatModelSelectorValue(
+							formatModelStringWithRouting(fallback.model),
+							fallback.thinkingLevel,
+						);
+						if (seenSelectors.has(fallbackSelector)) continue;
+						seenSelectors.add(fallbackSelector);
+						fallbackSelectors.push(fallbackSelector);
+					}
+					if (fallbackSelectors.length > 0) {
+						const modelRoles: Record<string, string> = {};
+						const existingRoles = settings.getModelRoles();
+						for (const role in existingRoles) {
+							const selector = existingRoles[role];
+							if (selector) {
+								modelRoles[role] = selector;
+							}
+						}
+						modelRoles[options.modelPatternFallbackRole] = primarySelector;
+						settings.override("modelRoles", modelRoles);
+						const fallbackChains: Record<string, string[]> = {
+							[options.modelPatternFallbackRole]: fallbackSelectors,
+						};
+						const existingFallbackChains = settings.get("retry.fallbackChains");
+						for (const role in existingFallbackChains) {
+							if (role !== options.modelPatternFallbackRole) {
+								fallbackChains[role] = existingFallbackChains[role];
+							}
+						}
+						settings.override("retry.fallbackChains", fallbackChains);
+					}
+				}
+				model = selectedModel;
 				modelFallbackMessage = undefined;
-			} else {
-				modelFallbackMessage = `Model "${options.modelPattern}" not found`;
+				if (selectedExplicitThinkingLevel) {
+					restoredSessionThinkingLevel = selectedThinkingLevel;
+				}
+				thinkingLevel = pickInitialThinkingLevel(selectedModel);
+				autoThinking = thinkingLevel === AUTO_THINKING;
+				effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
+				effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+					autoThinking
+						? resolveProvisionalAutoLevel(selectedModel)
+						: resolveThinkingLevelForModel(selectedModel, effectiveThinkingLevel),
+				);
+				preconnectModelHost(selectedModel.baseUrl);
+				break;
+			}
+			if (!model) {
+				const requested =
+					deferredModelPatterns.length === 1
+						? `"${deferredModelPatterns[0]}"`
+						: `one of ${deferredModelPatterns.map(pattern => `"${pattern}"`).join(", ")}`;
+				modelFallbackMessage = `Model ${requested} not found`;
 			}
 		}
 
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
-		if (!model && !options.modelPattern) {
+		if (!model && deferredModelPatterns.length === 0) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);
@@ -1978,7 +2108,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const reResolvedRoleSpec = resolveModelRoleValue(settings.getModelRole("default"), fallbackCandidates, {
 					settings,
 					matchPreferences: modelMatchPreferences,
-					modelRegistry,
 				});
 				if (reResolvedRoleSpec.model) {
 					defaultRoleSpec = reResolvedRoleSpec;
@@ -1990,7 +2119,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					// so the role's explicit selector (e.g. `:max`) now applies.
 					thinkingLevel = pickInitialThinkingLevel(resolvedDefaultModel);
 					autoThinking = thinkingLevel === AUTO_THINKING;
-					effectiveThinkingLevel = thinkingLevel === AUTO_THINKING ? undefined : thinkingLevel;
+					effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
 					effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
 						autoThinking
 							? resolveProvisionalAutoLevel(resolvedDefaultModel)
@@ -2016,6 +2145,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					patterns && patterns.length > 0
 						? `No model available matching enabledModels (${patterns.join(", ")}) with usable credentials. Configure auth for an allowed provider or adjust enabledModels.`
 						: "No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
+			}
+		}
+
+		if (model) {
+			const selectedModel = model;
+			const refreshedModel = await logger.time("refreshInitialModelMetadata", () =>
+				modelRegistry.refreshSelectedModelMetadata(selectedModel),
+			);
+			if (refreshedModel !== selectedModel) {
+				model = refreshedModel;
+				thinkingLevel = pickInitialThinkingLevel(refreshedModel);
+				autoThinking = thinkingLevel === AUTO_THINKING;
+				effectiveThinkingLevel = concreteThinkingLevel(thinkingLevel);
+				effectiveThinkingLevel = logger.time("resolveThinkingLevelForModel", () =>
+					autoThinking
+						? resolveProvisionalAutoLevel(refreshedModel)
+						: resolveThinkingLevelForModel(refreshedModel, effectiveThinkingLevel),
+				);
 			}
 		}
 
@@ -2156,6 +2303,34 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		let mcpDiscoveryEnabled = effectiveDiscoveryMode !== "off"; // back-compat: true when any discovery active
 
+		async function enableDeferredMCPDiscoveryForTools(
+			liveSession: AgentSession,
+			mcpTools: CustomTool[],
+		): Promise<boolean> {
+			if (mcpDiscoveryEnabled) return true;
+			const nonMCPToolNames = [...toolRegistry.keys()].filter(name => !isMCPToolName(name));
+			const projectedMode = resolveEffectiveToolDiscoveryMode(
+				settings,
+				countToolsForAutoDiscovery([...nonMCPToolNames, ...mcpTools.map(tool => tool.name)]),
+			);
+			if (projectedMode === "off") return false;
+
+			effectiveDiscoveryMode = projectedMode;
+			mcpDiscoveryEnabled = true;
+			liveSession.enableMCPDiscovery();
+			if (!toolRegistry.has("search_tool_bm25")) {
+				const searchTool: Tool = new SearchToolBm25Tool(toolSession);
+				toolRegistry.set(
+					searchTool.name,
+					new ExtensionToolWrapper(wrapToolWithMetaNotice(searchTool), extensionRunner) as Tool,
+				);
+			}
+			if (!liveSession.getActiveToolNames().includes("search_tool_bm25")) {
+				await liveSession.setActiveToolsByName([...liveSession.getActiveToolNames(), "search_tool_bm25"]);
+			}
+			return true;
+		}
+
 		const reloadSshTool = async (): Promise<AgentTool | null> => {
 			if (!requestedToolNameSet.has("ssh")) return null;
 			const sshTool = (await loadSshTool({
@@ -2179,10 +2354,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// `auto` enforces the per-model policy (inline for Gemini, off otherwise);
 		// like the rest of the prune machinery this is fixed for the session, so a
 		// mid-session model switch keeps the start-time decision.
-		const inlineToolDescriptors = shouldInlineToolDescriptors(
-			settings.get("inlineToolDescriptors"),
-			model ? (modelRegistry.getCanonicalId(model) ?? model.id) : undefined,
-		);
+		const inlineToolDescriptors = shouldInlineToolDescriptors(settings.get("inlineToolDescriptors"), model?.id);
 		const eagerTasks = settings.get("task.eager") !== "default";
 		const eagerTasksAlways = settings.get("task.eager") === "always";
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
@@ -2278,11 +2450,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				eagerTasks,
 				eagerTasksAlways,
 				taskBatch: settings.get("task.batch"),
+				taskMaxConcurrency: settings.get("task.maxConcurrency"),
+				taskIrcEnabled: isIrcEnabled(settings, options.taskDepth ?? 0),
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				includeWorkspaceTree,
 				memoryRootEnabled: memoryBackend.id === "local",
-				model: settings.get("includeModelInPrompt") ? getActiveModelString() : undefined,
+				model: getActiveModelString(),
+				includeModelInPrompt: settings.get("includeModelInPrompt"),
 				personality: agentKind === "sub" ? "none" : settings.get("personality"),
 				renderMermaid: settings.get("tui.renderMermaid"),
 				activeRepoContext,
@@ -2430,6 +2605,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		hasRegistered = true;
 
+		setActiveToolNames(initialToolNames);
 		const { systemPrompt } = await logger.time(
 			"buildSystemPrompt",
 			rebuildSystemPrompt,
@@ -2566,7 +2742,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			onPayload,
 			onResponse,
 			sessionId: providerSessionId,
-			promptCacheKey: options.providerPromptCacheKey,
+			promptCacheKey: providerPromptCacheKey,
 			deadline: options.deadline,
 			transformContext,
 			transformProviderContext,
@@ -2691,6 +2867,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agent,
 			pruneToolDescriptions: inlineToolDescriptors,
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
+			downshift: options.downshift,
+			planYolo: options.planYolo,
 			serviceTierByFamily: initialServiceTierByFamily,
 			sessionManager,
 			settings,
@@ -2712,6 +2890,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			skillsSettings: settings.getGroup("skills"),
 			modelRegistry,
 			toolRegistry,
+			createVibeTools:
+				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
+					? () => createVibeTools(toolSession)
+					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
 			transformContext,
 			transformProviderContext,
@@ -2724,6 +2906,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			rebuildSystemPrompt,
 			reloadSshTool,
 			requestedToolNames: requestedToolNameSet,
+			setActiveToolNames,
 			getMcpServerInstructions: mcpManager
 				? () => {
 						const raw = mcpManager.getServerInstructions();
@@ -2749,8 +2932,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentId: resolvedAgentId,
 			agentKind,
 			providerSessionId: options.providerSessionId,
+			providerPromptCacheKeySource,
 			parentEvalSessionId: options.parentEvalSessionId,
 			advisorTools,
+			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
 		if (asyncJobManager) {
@@ -2913,18 +3098,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			mcpManager.setOnToolsChanged(tools => {
 				void (async () => {
 					try {
-						await session.refreshMCPTools(
-							tools,
-							deferMCPDiscoveryForUI && !mcpDiscoveryEnabled && options.toolNames === undefined
-								? { activateAll: true }
-								: undefined,
-						);
-						if (deferMCPDiscoveryForUI && !mcpDiscoveryEnabled && explicitlyRequestedMCPToolNames.length > 0) {
-							await session.setActiveToolsByName([
-								...session.getActiveToolNames(),
-								...explicitlyRequestedMCPToolNames,
-							]);
+						let activateAll = deferMCPDiscoveryForUI && !mcpDiscoveryEnabled;
+						if (activateAll && (await enableDeferredMCPDiscoveryForTools(session, tools))) {
+							activateAll = false;
 						}
+						await session.refreshMCPTools(tools, activateAll ? { activateAll: true } : undefined);
 					} catch (error) {
 						logger.warn("MCP tool refresh failed", {
 							error: error instanceof Error ? error.message : String(error),
@@ -2966,7 +3144,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		startDeferredMCPDiscovery?.(session, {
 			mcpDiscoveryEnabled,
 			explicitlyRequestedMCPToolNames,
-			activateAllMCPTools: !mcpDiscoveryEnabled && options.toolNames === undefined,
+			activateAllMCPTools: !mcpDiscoveryEnabled,
 		});
 
 		return {

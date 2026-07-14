@@ -49,6 +49,7 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `SYNTHETIC_API_KEY`             | Synthetic auth                                   | Using Synthetic models                                         |                                                                                                     |
 | `NVIDIA_API_KEY`                | NVIDIA auth                                      | Using `nvidia` provider                                        |                                                                                                     |
 | `NANO_GPT_API_KEY`              | NanoGPT auth                                     | Using `nanogpt` provider                                       |                                                                                                     |
+| `NOVITA_API_KEY`                | Novita auth                                      | Using `novita` provider                                        |                                                                                                     |
 | `VENICE_API_KEY`                | Venice auth                                      | Using `venice` provider                                        |                                                                                                     |
 | `LITELLM_API_KEY`               | LiteLLM auth                                     | Using `litellm` provider                                       | OpenAI-compatible LiteLLM proxy key                                                                 |
 | `LM_STUDIO_API_KEY`             | LM Studio auth (optional)                        | Using `lm-studio` provider with authenticated hosts            | Local LM Studio usually runs without auth; any non-empty token works when a key is required         |
@@ -127,6 +128,12 @@ When `CLAUDE_CODE_USE_FOUNDRY` is enabled, Anthropic requests switch to Foundry 
   Each accepts either:
   - a filesystem path to PEM content, or
   - inline PEM (including escaped `\n` sequences).
+
+  `NODE_EXTRA_CA_CERTS` is honoured for every provider fetch (OpenAI-compatible,
+  Codex, Ollama, Azure Responses, Google, Anthropic), not just Foundry — Bun's
+  `fetch` does not consume the env var natively, so the bundle is merged into
+  `RequestInit.tls.ca` alongside the system root store. The `CLAUDE_CODE_*` mTLS
+  material remains Anthropic-Foundry-specific.
 
 | Variable                    | Value type                                     | Behavior                                                                      |
 | --------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------- |

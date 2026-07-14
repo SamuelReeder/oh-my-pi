@@ -14,12 +14,12 @@ import type {
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
 import { resolveModelServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
-import { buildModelProviderPriorityRank, type CanonicalModelVariant } from "@oh-my-pi/pi-catalog/identity";
+import { buildModelProviderPriorityRank } from "@oh-my-pi/pi-catalog/identity";
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { formatDuration, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import type { ApiKeyResolverModel } from "../config/api-key-resolver";
-import { type CanonicalModelQueryOptions, ModelRegistry } from "../config/model-registry";
+import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelSelectorValue,
 	formatModelString,
@@ -30,7 +30,12 @@ import { buildServiceTierByFamily, serviceTierForAllFamilies, serviceTierSetting
 import { Settings } from "../config/settings";
 import benchPrompt from "../prompts/bench.md" with { type: "text" };
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
-import { resolveThinkingLevelForModel, shouldDisableReasoning, toReasoningEffort } from "../thinking";
+import {
+	concreteThinkingLevel,
+	resolveThinkingLevelForModel,
+	shouldDisableReasoning,
+	toReasoningEffort,
+} from "../thinking";
 
 const DEFAULT_RUNS = 10;
 const DEFAULT_PAR = 4;
@@ -55,9 +60,6 @@ export interface BenchModelRegistry {
 	getAll(): Model<Api>[];
 	getApiKey(model: Model<Api>, sessionId?: string): Promise<string | undefined>;
 	resolver(model: ApiKeyResolverModel, sessionId?: string): ApiKeyResolver;
-	resolveCanonicalModel?(canonicalId: string, options?: CanonicalModelQueryOptions): Model<Api> | undefined;
-	getCanonicalVariants?(canonicalId: string, options?: CanonicalModelQueryOptions): CanonicalModelVariant[];
-	getCanonicalId?(model: Model<Api>): string | undefined;
 	hasConfiguredAuth?(model: Model<Api>): boolean;
 }
 
@@ -72,7 +74,7 @@ export interface BenchRunSuccess {
 	ttftMs: number;
 	durationMs: number;
 	outputTokens: number;
-	/** Generation throughput measured over the post-first-token window. */
+	/** Output tokens/sec over the total request duration. */
 	tokensPerSecond: number;
 }
 
@@ -179,23 +181,6 @@ function hasVisibleFinalContent(message: AssistantMessage): boolean {
 	});
 }
 
-/**
- * Tokens/s over the generation window (duration minus TTFT) so queue/prefill
- * latency does not dilute throughput. Falls back to total duration when the
- * response arrived as a single chunk (TTFT ~ duration).
- */
-export function computeTokensPerSecond(
-	outputTokens: number,
-	durationMs: number,
-	ttftMs: number,
-	deltaChunkCount: number,
-): number {
-	const decodeMs = durationMs - ttftMs;
-	// Fall back to total duration when the response arrived as a single chunk/non-streaming.
-	const windowMs = decodeMs > 0 && deltaChunkCount >= 2 ? decodeMs : durationMs;
-	return windowMs > 0 ? (outputTokens * 1000) / windowMs : 0;
-}
-
 interface BenchRequestOptions {
 	apiKey: ApiKeyResolver;
 	sessionId: string;
@@ -245,16 +230,9 @@ async function runBenchRequest(
 			headers: model.provider === "openrouter" ? { "X-OpenRouter-Cache": "false" } : undefined,
 		});
 		let message: AssistantMessage | undefined;
-		let deltaChunkCount = 0;
 		for await (const event of stream) {
 			if (firstTokenAt === undefined && isFirstTokenEvent(event)) {
 				firstTokenAt = now();
-			}
-			if (
-				(event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta") &&
-				event.delta.length > 0
-			) {
-				deltaChunkCount++;
 			}
 			if (event.type === "error") {
 				return { ok: false, error: event.error.errorMessage ?? "request failed" };
@@ -289,7 +267,12 @@ async function runBenchRequest(
 			ttftMs,
 			durationMs,
 			outputTokens,
-			tokensPerSecond: computeTokensPerSecond(outputTokens, durationMs, ttftMs, deltaChunkCount),
+			// TPS over the TOTAL request duration, deliberately not the post-TTFT
+			// decode window: reasoning models can spend seconds generating hidden
+			// thinking tokens (counted in usage.output) before the first visible
+			// byte, so "duration - TTFT" inflates TPS several-fold on providers
+			// that buffer or hide reasoning (e.g. google vs google-vertex).
+			tokensPerSecond: durationMs > 0 ? (outputTokens * 1000) / durationMs : 0,
 		};
 	} catch (error) {
 		return { ok: false, error: getErrorMessage(error) };
@@ -440,13 +423,7 @@ function resolveAuthenticatedAlternative(
 		seen.add(key);
 		if (modelRegistry.hasConfiguredAuth?.(candidate)) authenticated.push(candidate);
 	};
-	// Canonical variants link the same logical model across providers even when
-	// ids differ (e.g. fireworks `gpt-oss-20b` <-> openrouter `openai/gpt-oss-20b`).
-	const canonicalId = modelRegistry.getCanonicalId?.(model);
-	if (canonicalId) {
-		for (const variant of modelRegistry.getCanonicalVariants?.(canonicalId) ?? []) consider(variant.model);
-	}
-	// Same-id fallback for entries outside the canonical index.
+	// Same-id fallback for equivalent entries under providers with configured auth.
 	for (const candidate of modelRegistry.getAll()) {
 		if (candidate.id === model.id) consider(candidate);
 	}
@@ -486,7 +463,7 @@ function resolveBenchModels(
 		resolved.push({
 			selector,
 			model,
-			thinking: resolveThinkingLevelForModel(model, result.thinkingLevel),
+			thinking: resolveThinkingLevelForModel(model, concreteThinkingLevel(result.thinkingLevel)),
 		});
 	}
 	if (errors.length > 0) {

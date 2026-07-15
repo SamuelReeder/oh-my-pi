@@ -16,6 +16,7 @@
 - Added a project-scoped `launch` tool for shared long-running services and debuggers, with readiness probes, bounded logs, PTY input, restart policies, and automatic teardown after the last omp instance exits. Gated behind the `launch.enabled` setting (default on); when disabled the tool is withdrawn and the bash prompt drops its "use launch" guidance.
 - Added `detached` `launch` starts for standalone services that survive every omp instance and broker shutdown, then reconnect to the next broker for logs and explicit stop.
 - Added a `discovery.baseUrl` option to `models.yml` custom providers using `openai-models-list` discovery, letting the model-list fetch target a different URL than the one completions/responses requests use — needed for gateways whose `GET /models` requires a path segment (e.g. `/v1`) that their `POST /chat/completions` route rejects.
+- Added a `group` option to `models.yml` providers: providers sharing the same `group` render as one merged section in `omp models`/`omp models find` (with a `provider` column disambiguating rows) instead of one section per provider id — useful when several logical providers (e.g. `anthropic`/`openai`/`azure`) route through the same physical gateway. Purely cosmetic; filtering by group name or by individual provider id both still work, and `--json` output carries the resolved `group` per model.
 
 ### Changed
 

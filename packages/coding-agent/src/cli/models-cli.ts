@@ -64,6 +64,8 @@ export function resolveModelsArgs(
 
 interface ModelJson {
 	provider: string;
+	/** Display group (from `models.yml`'s `group` field), or `provider` when unset. */
+	group: string;
 	id: string;
 	selector: string;
 	name: string;
@@ -102,9 +104,10 @@ function byProviderThenId(left: Model<Api>, right: Model<Api>): number {
 	return left.id.localeCompare(right.id);
 }
 
-function toModelJson(model: Model<Api>): ModelJson {
+function toModelJson(model: Model<Api>, group: string): ModelJson {
 	return {
 		provider: model.provider,
+		group,
 		id: model.id,
 		selector: `${model.provider}/${model.id}`,
 		name: model.name,
@@ -172,13 +175,16 @@ function renderProviderModels(
 	json: boolean,
 ): void {
 	const available = modelRegistry.getAvailable();
+	const groupOf = (model: Model<Api>): string => modelRegistry.getProviderGroup(model.provider) ?? model.provider;
 	const needle = pattern?.toLowerCase();
 	let filtered = available;
 
 	if (needle) {
 		let exactFound = false;
 		if (action !== "find") {
-			const exact = available.filter(m => m.provider.toLowerCase() === needle);
+			const exact = available.filter(
+				m => m.provider.toLowerCase() === needle || groupOf(m).toLowerCase() === needle,
+			);
 			if (exact.length > 0) {
 				filtered = exact;
 				exactFound = true;
@@ -189,6 +195,7 @@ function renderProviderModels(
 				model =>
 					model.id.toLowerCase().includes(needle) ||
 					model.provider.toLowerCase().includes(needle) ||
+					groupOf(model).toLowerCase().includes(needle) ||
 					`${model.provider}/${model.id}`.toLowerCase().includes(needle) ||
 					model.name.toLowerCase().includes(needle),
 			);
@@ -203,7 +210,12 @@ function renderProviderModels(
 				`Warning: models.yml validation failed — custom providers disabled\n${configError.message}\n`,
 			);
 		}
-		const output: ModelsJson = { models: filtered.slice().sort(byProviderThenId).map(toModelJson) };
+		const output: ModelsJson = {
+			models: filtered
+				.slice()
+				.sort(byProviderThenId)
+				.map(model => toModelJson(model, groupOf(model))),
+		};
 		writeLine(JSON.stringify(output));
 		return;
 	}
@@ -221,23 +233,28 @@ function renderProviderModels(
 		return;
 	}
 
-	// One section per provider: bold heading + a box table of that provider's models.
-	const byProvider = new Map<string, Model<Api>[]>();
+	// One section per display group: bold heading + a box table of that group's
+	// models. Providers without a configured `group` form a group of one (their
+	// own provider id), preserving the historical one-section-per-provider view.
+	const byGroup = new Map<string, Model<Api>[]>();
 	for (const model of filtered.slice().sort(byProviderThenId)) {
-		let group = byProvider.get(model.provider);
-		if (!group) {
-			group = [];
-			byProvider.set(model.provider, group);
+		const group = groupOf(model);
+		let bucket = byGroup.get(group);
+		if (!bucket) {
+			bucket = [];
+			byGroup.set(group, bucket);
 		}
-		group.push(model);
+		bucket.push(model);
 	}
 
-	let firstProvider = true;
-	for (const [provider, models] of byProvider) {
-		if (!firstProvider) writeLine();
-		firstProvider = false;
-		writeLine(`${chalk.bold.cyan(provider)} ${chalk.dim(`(${models.length})`)}`);
+	let firstGroup = true;
+	for (const [group, models] of byGroup) {
+		if (!firstGroup) writeLine();
+		firstGroup = false;
+		const spansProviders = new Set(models.map(model => model.provider)).size > 1;
+		writeLine(`${chalk.bold.cyan(group)} ${chalk.dim(`(${models.length})`)}`);
 		const rows = models.map(model => [
+			...(spansProviders ? [model.provider] : []),
 			model.id,
 			formatLimit(model.contextWindow),
 			formatLimit(model.maxTokens),
@@ -246,9 +263,10 @@ function renderProviderModels(
 		]);
 		for (const line of boxTable(
 			[
+				...(spansProviders ? [{ header: "provider" }] : []),
 				{ header: "model" },
-				{ header: "context", align: "right" },
-				{ header: "max-out", align: "right" },
+				{ header: "context", align: "right" as const },
+				{ header: "max-out", align: "right" as const },
 				{ header: "thinking" },
 				{ header: "images" },
 			],

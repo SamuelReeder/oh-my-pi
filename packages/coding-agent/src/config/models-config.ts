@@ -33,6 +33,7 @@ export interface ProviderValidationConfig {
 	remoteCompaction?: unknown;
 	disableStrictTools?: boolean;
 	modelOverrides?: Record<string, unknown>;
+	group?: string;
 	models: ProviderValidationModel[];
 }
 
@@ -56,10 +57,11 @@ export function validateProviderConfiguration(
 				!config.disableStrictTools &&
 				!config.remoteCompaction &&
 				!hasModelOverrides &&
-				!config.discovery
+				!config.discovery &&
+				!config.group
 			) {
 				throw new Error(
-					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "disableStrictTools", "remoteCompaction", "modelOverrides", "discovery", or "models"`,
+					`Provider ${providerName}: must specify "baseUrl", "headers", "apiKey", "auth: none", "compat", "disableStrictTools", "remoteCompaction", "modelOverrides", "discovery", "group", or "models"`,
 				);
 			}
 		}
@@ -125,6 +127,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					remoteCompaction: providerConfig.remoteCompaction,
 					disableStrictTools: providerConfig.disableStrictTools,
 					modelOverrides: providerConfig.modelOverrides,
+					group: providerConfig.group,
 					models: (providerConfig.models ?? []) as ProviderValidationModel[],
 				},
 				"models-config",

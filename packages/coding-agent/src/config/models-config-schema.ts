@@ -284,12 +284,24 @@ const ProviderConfigSchema = type({
 	 * and `apiKey` must carry the gateway bearer.
 	 */
 	"transport?": '"pi-native"',
+	/**
+	 * Display-only label for `omp models`. Providers sharing the same `group`
+	 * render as one merged section (heading + table) instead of one section
+	 * per provider id — for backends that expose several logical providers
+	 * (e.g. `anthropic`/`openai`/`azure`) through a single physical gateway.
+	 * Purely cosmetic: auth, discovery, and routing stay keyed on the
+	 * provider id.
+	 */
+	"group?": "string",
 }).narrow((value, ctx) => {
 	if (value.baseUrl !== undefined && typeof value.baseUrl === "string" && value.baseUrl.length === 0) {
 		return ctx.mustBe("baseUrl a non-empty string");
 	}
 	if (value.apiKey !== undefined && typeof value.apiKey === "string" && value.apiKey.length === 0) {
 		return ctx.mustBe("apiKey a non-empty string");
+	}
+	if (value.group !== undefined && typeof value.group === "string" && value.group.length === 0) {
+		return ctx.mustBe("group a non-empty string");
 	}
 	return true;
 });

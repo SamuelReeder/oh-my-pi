@@ -266,6 +266,8 @@ interface CustomModelsResult {
 	keylessProviders?: Set<string>;
 	discoverableProviders?: DiscoveryProviderConfig[];
 	configuredProviders?: Set<string>;
+	/** Provider id -> display group from `models.yml`'s `group` field (omp models section merging). */
+	providerGroups?: Map<string, string>;
 	error?: ConfigError;
 	found: boolean;
 }
@@ -745,6 +747,7 @@ export class ModelRegistry {
 	#keylessProviders: Set<string> = new Set();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
 	#customModelOverlays: CustomModelOverlay[] = [];
+	#providerGroups: Map<string, string> = new Map();
 	#providerOverrides: Map<string, ProviderOverride> = new Map();
 	#modelOverrides: Map<string, Map<string, ModelOverride>> = new Map();
 	#configError: ConfigError | undefined = undefined;
@@ -945,6 +948,7 @@ export class ModelRegistry {
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
+		this.#providerGroups.clear();
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -977,6 +981,7 @@ export class ModelRegistry {
 			keylessProviders = new Set(),
 			discoverableProviders = [],
 			configuredProviders = new Set(),
+			providerGroups = new Map(),
 			error: configError,
 		} = this.#loadCustomModels();
 		this.#configError = configError;
@@ -985,6 +990,7 @@ export class ModelRegistry {
 		this.#customModelOverlays = customModels;
 		this.#providerOverrides = overrides;
 		this.#modelOverrides = modelOverrides;
+		this.#providerGroups = providerGroups;
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		let builtInModels = this.#applyHardcodedModelPolicies(this.#loadBuiltInModels(overrides));
@@ -1289,6 +1295,7 @@ export class ModelRegistry {
 		const allModelOverrides = new Map<string, Map<string, ModelOverride>>();
 		const keylessProviders = new Set<string>();
 		const discoverableProviders: DiscoveryProviderConfig[] = [];
+		const providerGroups = new Map<string, string>();
 		const providerEntries = Object.entries(value.providers ?? {});
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 		for (const [providerName, providerConfig] of providerEntries) {
@@ -1317,6 +1324,9 @@ export class ModelRegistry {
 					remoteCompaction: providerConfig.remoteCompaction,
 					transport: providerConfig.transport,
 				});
+			}
+			if (providerConfig.group) {
+				providerGroups.set(providerName, providerConfig.group);
 			}
 
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
@@ -1369,6 +1379,7 @@ export class ModelRegistry {
 			keylessProviders,
 			discoverableProviders,
 			configuredProviders,
+			providerGroups,
 			found: true,
 		};
 	}
@@ -1974,6 +1985,11 @@ export class ModelRegistry {
 		return this.#discoverableProviders
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);
+	}
+
+	/** Display group for `provider` from `models.yml`'s `group` field, or `undefined` if unset. */
+	getProviderGroup(provider: string): string | undefined {
+		return this.#providerGroups.get(provider);
 	}
 
 	getProviderDiscoveryState(provider: string): ProviderDiscoveryState | undefined {

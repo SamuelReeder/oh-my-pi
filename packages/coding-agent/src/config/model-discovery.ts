@@ -635,15 +635,25 @@ export async function discoverOpenAIModelsList(
 	providerConfig: DiscoveryProviderConfig,
 	ctx: DiscoveryContext,
 ): Promise<Model<Api>[]> {
-	const baseUrl = normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl);
-	const modelsUrl = `${baseUrl}/models`;
+	// `discovery.baseUrl` lets a provider fetch its model list from a
+	// different host/path than the one completions/responses requests use
+	// (e.g. a gateway whose `GET /models` requires a `/v1` suffix its
+	// `POST /chat/completions` route 404s on). Defaults to `baseUrl`, matching
+	// every other discovery-eligible provider where the two coincide.
+	const discoveryBaseUrl = normalizeOpenAIModelsListBaseUrl(
+		providerConfig.discovery.baseUrl ?? providerConfig.baseUrl,
+	);
+	const modelsUrl = `${discoveryBaseUrl}/models`;
+	const completionsBaseUrl = providerConfig.discovery.baseUrl
+		? (providerConfig.baseUrl?.replace(/\/+$/, "") ?? discoveryBaseUrl)
+		: discoveryBaseUrl;
 
 	const baseHeaders: Record<string, string> = { ...(providerConfig.headers ?? {}) };
 	let headers = baseHeaders;
 	const attempt = async (h: Record<string, string>) => {
 		const nativeMetadataPromise =
 			providerConfig.discovery.type === "lm-studio"
-				? fetchLmStudioNativeModelMetadata(baseUrl, ctx.fetch, { headers: h })
+				? fetchLmStudioNativeModelMetadata(discoveryBaseUrl, ctx.fetch, { headers: h })
 				: Promise.resolve(null);
 		const [payload, nativeMetadata] = await Promise.all([
 			withTimeoutSignal(10_000, async signal => {
@@ -697,7 +707,7 @@ export async function discoverOpenAIModelsList(
 				name: reference?.name ?? id,
 				api: providerConfig.api,
 				provider: providerConfig.provider,
-				baseUrl,
+				baseUrl: completionsBaseUrl,
 				reasoning: reference?.reasoning ?? false,
 				thinking: reference?.thinking,
 				input: nativeMetadataForModel?.input ?? reference?.input ?? ["text"],

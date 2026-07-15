@@ -249,6 +249,13 @@ export type ModelOverride = typeof ModelOverrideSchema.infer;
 
 export const ProviderDiscoverySchema = type({
 	type: '"ollama" | "llama.cpp" | "lm-studio" | "openai-models-list" | "proxy" | "litellm"',
+	/**
+	 * Override the base URL used to discover the model list, when it differs
+	 * from the base URL the completions/responses requests are sent to (e.g. a
+	 * gateway that requires `/v1` on `GET /models` but rejects it on
+	 * `POST /chat/completions`). Defaults to the provider's `baseUrl`.
+	 */
+	"baseUrl?": "string",
 });
 
 export const ProviderAuthSchema = type('"apiKey" | "none" | "oauth"');

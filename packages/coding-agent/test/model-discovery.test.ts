@@ -1681,6 +1681,34 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(fallback?.contextWindow).toBe(128000);
 	});
 
+	test("openai-models-list discovery.baseUrl overrides only the model-list fetch, not the model's wire baseUrl", async () => {
+		writeRawModelsJson({
+			"gateway-test": {
+				baseUrl: "http://127.0.0.1:9996",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list", baseUrl: "http://127.0.0.1:9996/v1" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9996/v1/models") {
+				return new Response(JSON.stringify({ data: [{ id: "gateway-test/some-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.getAll().find(m => m.provider === "gateway-test" && m.id === "gateway-test/some-model");
+		// Discovery hit the `/v1`-suffixed override URL (asserted via the mock
+		// throwing on any other URL); the model itself keeps the provider's
+		// plain `baseUrl` for completions requests.
+		expect(model?.baseUrl).toBe("http://127.0.0.1:9996");
+	});
+
 	test("openai-models-list discovery enriches thin /v1/models payloads from the bundled reference catalog", async () => {
 		writeRawModelsJson({
 			"openai-test": {

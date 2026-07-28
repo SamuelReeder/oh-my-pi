@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import {
@@ -12,6 +13,8 @@ import {
 } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { GlobTool } from "@oh-my-pi/pi-coding-agent/tools/glob";
 import { getAgentDir, removeWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 // Mnemopi state is loaded lazily; preload so `new MnemopiSessionState(...)` can
@@ -55,6 +58,17 @@ async function withMemoryFixture(fn: (fixture: MemoryFixture) => Promise<void>):
 	}
 }
 
+function createGlobTool(cwd: string): GlobTool {
+	const session: ToolSession = {
+		cwd,
+		hasUI: false,
+		settings: Settings.isolated({}),
+		getSessionFile: () => null,
+		getSessionSpawns: () => null,
+	};
+	return new GlobTool(session);
+}
+
 describe("MemoryProtocolHandler", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
@@ -78,6 +92,66 @@ describe("MemoryProtocolHandler", () => {
 		});
 	});
 
+	it("resolves memory://root against the caller cwd when multiple sessions are live", async () => {
+		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-isolation-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const agentDir = path.join(cleanupRoot, "agent");
+			setAgentDir(agentDir);
+
+			const firstCwd = path.join(cleanupRoot, "first-project");
+			const secondCwd = path.join(cleanupRoot, "second-project");
+			await fs.mkdir(firstCwd, { recursive: true });
+			await fs.mkdir(secondCwd, { recursive: true });
+
+			const firstMemoryRoot = getMemoryRoot(agentDir, firstCwd);
+			const secondMemoryRoot = getMemoryRoot(agentDir, secondCwd);
+			await fs.mkdir(firstMemoryRoot, { recursive: true });
+			await fs.mkdir(secondMemoryRoot, { recursive: true });
+
+			const firstSummary = "first registered session summary";
+			const secondSummary = "second session cwd summary";
+			await Bun.write(path.join(firstMemoryRoot, "memory_summary.md"), firstSummary);
+			await Bun.write(path.join(secondMemoryRoot, "memory_summary.md"), secondSummary);
+
+			AgentRegistry.global().register({
+				id: "first-session",
+				displayName: "first-session",
+				kind: "main",
+				session: {
+					sessionManager: {
+						getCwd: () => firstCwd,
+						getArtifactsDir: () => null,
+						getSessionId: () => "first-session",
+					},
+				} as unknown as AgentSession,
+				sessionFile: null,
+			});
+			AgentRegistry.global().register({
+				id: "second-session",
+				displayName: "second-session",
+				kind: "main",
+				session: {
+					sessionManager: {
+						getCwd: () => secondCwd,
+						getArtifactsDir: () => null,
+						getSessionId: () => "second-session",
+					},
+				} as unknown as AgentSession,
+				sessionFile: null,
+			});
+
+			const router = InternalUrlRouter.instance();
+			const resource = await router.resolve("memory://root", { cwd: secondCwd });
+
+			expect(resource.content).toBe(secondSummary);
+			expect(resource.content).not.toBe(firstSummary);
+		} finally {
+			setAgentDir(previousAgentDir);
+			await removeWithRetries(cleanupRoot);
+		}
+	});
+
 	it("resolves memory://root/<path> within memory root", async () => {
 		await withMemoryFixture(async ({ memoryRoot }) => {
 			const skillPath = path.join(memoryRoot, "skills", "demo", "SKILL.md");
@@ -90,6 +164,67 @@ describe("MemoryProtocolHandler", () => {
 			expect(resource.content).toBe("demo skill");
 			expect(resource.contentType).toBe("text/markdown");
 		});
+	});
+
+	it("prefers the caller cwd memory root over earlier registered sessions", async () => {
+		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const agentDir = path.join(cleanupRoot, "agent");
+			await fs.mkdir(agentDir, { recursive: true });
+			setAgentDir(agentDir);
+
+			const firstCwd = path.join(cleanupRoot, "project-a");
+			const secondCwd = path.join(cleanupRoot, "project-b");
+			await fs.mkdir(firstCwd, { recursive: true });
+			await fs.mkdir(secondCwd, { recursive: true });
+
+			const firstMemoryRoot = getMemoryRoot(agentDir, firstCwd);
+			const secondMemoryRoot = getMemoryRoot(agentDir, secondCwd);
+			await fs.mkdir(firstMemoryRoot, { recursive: true });
+			await fs.mkdir(secondMemoryRoot, { recursive: true });
+
+			await Bun.write(path.join(firstMemoryRoot, "memory_summary.md"), "first session summary");
+			const secondSummaryPath = path.join(secondMemoryRoot, "memory_summary.md");
+			await Bun.write(secondSummaryPath, "second session summary");
+
+			AgentRegistry.global().register({
+				id: "test-first",
+				displayName: "test first",
+				kind: "main",
+				session: {
+					sessionManager: {
+						getCwd: () => firstCwd,
+						getArtifactsDir: () => null,
+						getSessionId: () => "test-first",
+					},
+				} as unknown as AgentSession,
+				sessionFile: null,
+			});
+			AgentRegistry.global().register({
+				id: "test-second",
+				displayName: "test second",
+				kind: "main",
+				session: {
+					sessionManager: {
+						getCwd: () => secondCwd,
+						getArtifactsDir: () => null,
+						getSessionId: () => "test-second",
+					},
+				} as unknown as AgentSession,
+				sessionFile: null,
+			});
+
+			const resource = await InternalUrlRouter.instance().resolve("memory://root/memory_summary.md", {
+				cwd: secondCwd,
+			});
+
+			expect(resource.content).toBe("second session summary");
+			expect(resource.sourcePath).toBe(await fs.realpath(secondSummaryPath));
+		} finally {
+			setAgentDir(previousAgentDir);
+			await removeWithRetries(cleanupRoot);
+		}
 	});
 
 	it("throws for unknown memory namespace when no mnemopi backend is active", async () => {
@@ -112,6 +247,95 @@ describe("MemoryProtocolHandler", () => {
 			);
 		});
 	});
+
+	it("globs nested directories within the memory root", async () => {
+		await withMemoryFixture(async ({ cwd, memoryRoot }) => {
+			const nestedSkill = path.join(memoryRoot, "skills", "demo", "nested", "SKILL.md");
+			await fs.mkdir(path.dirname(nestedSkill), { recursive: true });
+			await Bun.write(nestedSkill, "nested skill");
+			await Bun.write(path.join(memoryRoot, "skills", "demo", "notes.txt"), "not markdown");
+
+			const tool = createGlobTool(cwd);
+			const result = await tool.execute("memory-glob", { path: "memory://root/skills/**/*.md" });
+
+			expect(result.details?.files).toHaveLength(1);
+			expect(result.details?.files?.[0]).toEndWith("/skills/demo/nested/SKILL.md");
+
+			const rootResult = await tool.execute("memory-root-glob", { path: "memory://root/**/*.md" });
+
+			expect(rootResult.details?.files).toHaveLength(1);
+			expect(rootResult.details?.files?.[0]).toEndWith("/skills/demo/nested/SKILL.md");
+		});
+	});
+
+	it("preserves literal question-mark wildcards in memory globs", async () => {
+		await withMemoryFixture(async ({ cwd, memoryRoot }) => {
+			const skillsDir = path.join(memoryRoot, "skills");
+			await fs.mkdir(skillsDir, { recursive: true });
+			await Bun.write(path.join(skillsDir, "a.md"), "single character");
+			await Bun.write(path.join(skillsDir, "ab.md"), "two characters");
+
+			const result = await createGlobTool(cwd).execute("memory-question-glob", {
+				path: "memory://root/skills/?.md",
+			});
+
+			expect(result.details?.files).toHaveLength(1);
+			expect(result.details?.files?.[0]).toEndWith("/skills/a.md");
+		});
+	});
+
+	it("resolves encoded literal glob characters before the wildcard boundary", async () => {
+		await withMemoryFixture(async ({ cwd, memoryRoot }) => {
+			const encodedLiteralDir = path.join(memoryRoot, "skills", "[demo]");
+			await fs.mkdir(encodedLiteralDir, { recursive: true });
+			await Bun.write(path.join(encodedLiteralDir, "SKILL.md"), "encoded literal directory");
+
+			const result = await createGlobTool(cwd).execute("memory-encoded-literal-glob", {
+				path: "memory://root/skills/%5Bdemo%5D/*.md",
+			});
+
+			expect(result.details?.files).toHaveLength(1);
+			expect(result.details?.files?.[0]).toEndWith("/skills/[demo]/SKILL.md");
+		});
+	});
+
+	it("keeps encoded glob characters literal after the wildcard boundary", async () => {
+		await withMemoryFixture(async ({ cwd, memoryRoot }) => {
+			const skillsDir = path.join(memoryRoot, "skills");
+			await fs.mkdir(skillsDir, { recursive: true });
+			await Bun.write(path.join(skillsDir, "[demo].md"), "literal brackets");
+			await Bun.write(path.join(skillsDir, "d.md"), "single character");
+
+			const result = await createGlobTool(cwd).execute("memory-encoded-suffix-glob", {
+				path: "memory://root/*/%5Bdemo%5D.md",
+			});
+
+			expect(result.details?.files).toHaveLength(1);
+			expect(result.details?.files?.[0]).toEndWith("/skills/[demo].md");
+		});
+	});
+
+	it.each(["memory://root/skills/**/../*.md", "memory://root/skills/**/%2e%2e/*.md"])(
+		"rejects traversal in a memory glob suffix: %s",
+		async pattern => {
+			await withMemoryFixture(async ({ cwd }) => {
+				await expect(createGlobTool(cwd).execute("memory-glob-traversal", { path: pattern })).rejects.toThrow(
+					/traversal/i,
+				);
+			});
+		},
+	);
+
+	it.each(["memory://root/skills/**/demo%2fnested/*.md", "memory://root/skills/**/demo%5cnested/*.md"])(
+		"rejects encoded separators in a memory glob suffix: %s",
+		async pattern => {
+			await withMemoryFixture(async ({ cwd }) => {
+				await expect(createGlobTool(cwd).execute("memory-glob-separator", { path: pattern })).rejects.toThrow(
+					/encoded path separator/i,
+				);
+			});
+		},
+	);
 
 	it("throws clear error for missing files", async () => {
 		await withMemoryFixture(async () => {

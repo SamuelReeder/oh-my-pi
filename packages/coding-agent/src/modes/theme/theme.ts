@@ -20,7 +20,7 @@ import { defaultThemes } from "./defaults";
 import lightThemeJson from "./light.json" with { type: "json" };
 import { resolveMermaidAscii } from "./mermaid-cache";
 
-export { getLanguageFromPath } from "../../utils/lang-from-path";
+export { getLanguageFromPath, isMarkdownPath } from "../../utils/lang-from-path";
 
 // ============================================================================
 // Symbol Presets
@@ -92,6 +92,7 @@ export type SymbolKey =
 	// Icons
 	| "icon.model"
 	| "icon.plan"
+	| "icon.prewalk"
 	| "icon.goal"
 	| "icon.pause"
 	| "icon.loop"
@@ -301,6 +302,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	// Icons
 	"icon.model": "⬢",
 	"icon.plan": "🗺",
+	"icon.prewalk": "🏃",
 	"icon.goal": "🎯",
 	"icon.pause": "⏸",
 	"icon.loop": "↻",
@@ -562,6 +564,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.model": "\uec19",
 	// pick:  | alt:  
 	"icon.plan": "\uf2d2",
+	"icon.prewalk": "\uf29d",
 	// pick:  (nf-fa-bullseye) | alt:  (nf-md-target) ◎ ⌖
 	"icon.goal": "\uf140",
 	// pick:  (nf-fa-pause) | alt: ⏸ ||
@@ -611,8 +614,8 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.throughput": "\uf0e4",
 	// pick:  | alt:  
 	"icon.host": "\uf109",
-	// pick:  | alt:  
-	"icon.session": "\uf550",
+	// pick: 󰁑 (nf-md-arrow_left_bold_hexagon_outline) | alt:  
+	"icon.session": "\u{f0051}",
 	// pick:  | alt: 
 	"icon.package": "\uf487",
 	// pick:  | alt:  
@@ -819,6 +822,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	// Icons
 	"icon.model": "[M]",
 	"icon.plan": "plan",
+	"icon.prewalk": "prewalk",
 	"icon.goal": "goal",
 	"icon.pause": "||",
 	"icon.loop": "loop",
@@ -1819,6 +1823,7 @@ export class Theme {
 		return {
 			model: this.#symbols["icon.model"],
 			plan: this.#symbols["icon.plan"],
+			prewalk: this.#symbols["icon.prewalk"],
 			goal: this.#symbols["icon.goal"],
 			pause: this.#symbols["icon.pause"],
 			loop: this.#symbols["icon.loop"],

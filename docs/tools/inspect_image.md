@@ -40,7 +40,7 @@ TUI rendering adds presentation-only truncation from `packages/coding-agent/src/
 ## Flow
 1. `InspectImageTool.execute(...)` rejects immediately if `images.blockImages` is enabled in session settings.
 2. It reads `session.modelRegistry`; missing registry, empty registry, missing API key, or unresolved model each raise `ToolError` from `packages/coding-agent/src/tools/inspect-image.ts`.
-3. Model selection tries, in order, `pi/vision`, `pi/default`, the active model string from the session, then `availableModels[0]`. `expandRoleAlias(...)` and `resolveModelFromString(...)` handle each lookup.
+3. Model selection tries, in order, `@vision`, `@default`, the active model string from the session, then `availableModels[0]`. `expandRoleAlias(...)` and `resolveModelFromString(...)` handle each lookup.
 4. The chosen model must advertise `input.includes("image")`; otherwise execution fails before reading the file.
 5. `loadImageInput(...)` in `packages/coding-agent/src/utils/image-loading.ts` resolves the path with `resolveReadPath(...)`, detects MIME type with `readImageMetadata(...)`, and rejects files larger than `MAX_IMAGE_INPUT_BYTES` (`20 * 1024 * 1024`, 20 MiB) using `ImageInputTooLargeError`.
 6. `readImageMetadata(...)` in `packages/utils/src/mime.ts` inspects file headers only. Supported detected MIME types are `image/png`, `image/jpeg`, `image/gif`, and `image/webp`.
@@ -75,7 +75,7 @@ TUI rendering adds presentation-only truncation from `packages/coding-agent/src/
 ## Limits & Caps
 - Supported detected input formats: `image/png`, `image/jpeg`, `image/gif`, `image/webp` (`SUPPORTED_IMAGE_MIME_TYPES` in `packages/utils/src/mime.ts`).
 - Metadata sniff cap: `DEFAULT_IMAGE_METADATA_HEADER_BYTES = 256 * 1024` bytes. Format detection only reads up to 256 KiB from the file header.
-- Availability is gated by `inspect_image.enabled`, default `false`, in `packages/coding-agent/src/config/settings-schema.ts` / `packages/coding-agent/src/tools/index.ts`.
+- Availability is gated by `inspect_image.mode` (`auto`|`on`|`off`, default `auto`) in `packages/coding-agent/src/config/settings-schema.ts`, resolved with the session-scoped `/vision` override and the active model's image capability in `packages/coding-agent/src/utils/inspect-image-mode.ts` / `packages/coding-agent/src/tools/index.ts`. `auto` registers the tool only when the active model lacks native image input; the legacy `inspect_image.enabled` boolean migrates to `mode` (`true`→`on`, `false`→`off`).
 - Upload input cap: `MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024` bytes (20 MiB) in `packages/coding-agent/src/utils/image-loading.ts`.
 - Auto-resize defaults in `packages/coding-agent/src/utils/image-resize.ts`:
   - `maxWidth: 1568`

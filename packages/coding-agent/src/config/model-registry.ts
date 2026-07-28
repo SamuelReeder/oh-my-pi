@@ -2260,6 +2260,7 @@ export class ModelRegistry {
 	/** Display group for `provider` from `models.yml`'s `group` field, or `undefined` if unset. */
 	getProviderGroup(provider: string): string | undefined {
 		return this.#providerGroups.get(provider);
+	}
 	/**
 	 * Whether `providerId` is known to the registry: it has at least one live
 	 * model, or it is configured for dynamic discovery (models.yml `discovery:`

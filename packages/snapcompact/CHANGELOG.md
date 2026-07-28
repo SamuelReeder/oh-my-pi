@@ -2,9 +2,23 @@
 
 ## [Unreleased]
 
+## [17.1.5] - 2026-07-27
+
+### Fixed
+
+- Fixed snapcompact resume guides reporting only the HQ grid width for mixed-width foveated archives ([#6712](https://github.com/can1357/oh-my-pi/issues/6712)).
+
+## [17.1.0] - 2026-07-24
+
+### Added
+
+- Added an `includeThinking` serialization option (defaulting to `true`) to allow excluding assistant reasoning (`¶think:` sections) from archived transcripts.
+
+## [16.5.0] - 2026-07-13
+
 ### Changed
 
-- Changed archived transcript rendering to compact `¶user:`, `¶think:`, `¶ai:`, and `¶call:` scopes; repeated adjacent scopes now continue as plain lines, tool-call intents trail calls as `//` comments, and the compaction prompt documents the format.
+- Updated archived transcript rendering to use a more compact format with `¶user:`, `¶think:`, `¶ai:`, and `¶call:` scopes, omitting repeated adjacent scope headers and appending tool-call intents as comments.
 
 ## [16.3.7] - 2026-07-05
 

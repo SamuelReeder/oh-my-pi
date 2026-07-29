@@ -189,7 +189,13 @@ try {
 	// The package declares Bun as its build runtime. Invoke napi's JavaScript
 	// entry through this Bun process instead of its `#!/usr/bin/env node` shim so
 	// an old host Node installation cannot make an otherwise supported Bun build fail.
-	const buildResult = await $`${process.execPath} ${napiBin} ${napiArgs}`.nothrow();
+	// On Windows, `Bun.which("napi")` resolves to a self-contained `.exe` launcher
+	// (not a JS shim), so it must be executed directly — passing it to Bun makes
+	// Bun try to parse the PE binary as JavaScript and fail.
+	const isWindowsExe = process.platform === "win32" && napiBin.toLowerCase().endsWith(".exe");
+	const buildResult = isWindowsExe
+		? await $`${napiBin} ${napiArgs}`.nothrow()
+		: await $`${process.execPath} ${napiBin} ${napiArgs}`.nothrow();
 	if (buildResult.exitCode !== 0) {
 		const stdout = buildResult.stdout?.toString("utf-8") ?? "";
 		const stderr = buildResult.stderr?.toString("utf-8") ?? "";

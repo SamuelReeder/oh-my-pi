@@ -181,7 +181,11 @@ crate.annotation(
         # the UBSan runtime. Opus shipped without sanitizers under
         # cargo-zigbuild too.
         "CFLAGS": "-fno-sanitize=undefined",
-        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/run/current-system/sw/bin",
+        # Fixed, machine-independent install prefixes only (no $HOME-relative
+        # paths: this string is baked at MODULE.bazel eval time, with no
+        # shell/variable expansion when the build script's PATH is searched).
+        # Covers apt/brew (mac + Linuxbrew), Nix, and Snap cmake installs.
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/nix/var/nix/profiles/default/bin:/snap/bin:/run/current-system/sw/bin",
     },
 )
 

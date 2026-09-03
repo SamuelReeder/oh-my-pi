@@ -591,6 +591,23 @@ export class ModelRegistry {
 	 * and patch its context window to what the backend actually serves.
 	 */
 	async refreshSelectedModelMetadata(model: Model<Api>): Promise<Model<Api>> {
+		const discoverableConfig = this.#discoverableProviders.find(
+			providerConfig => providerConfig.provider === model.provider,
+		);
+		if (discoverableConfig) {
+			// The model cache never persists live request headers (#5780). A
+			// resumed session's previously-selected model can be restored from a
+			// disk row that has this model's headers omitted (and thus unusable),
+			// racing the background refetch that would otherwise reattach them.
+			// Force a synchronous online refetch before the first request goes
+			// out, rather than serving a request with a missing auth header.
+			const cacheProviderId = this.#configuredDiscoveryCacheProviderId(discoverableConfig);
+			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+			if (cache?.headerOmittedModelIds.includes(model.id)) {
+				await this.refreshProvider(model.provider, "online");
+				model = this.find(model.provider, model.id) ?? model;
+			}
+		}
 		const discoveryConfig = this.#findLazyRuntimeDiscovery(model.provider);
 		if (!discoveryConfig) {
 			return model;
